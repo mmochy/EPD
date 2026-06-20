@@ -1,12 +1,16 @@
 /**
  * 墨水屏控制台主模块
- * 负责蓝牙连接、命令发送、图像传输、假期同步、残影消除、界面交互等
- * 依赖：ble_transfer.js, crop.js, paint.js, ditheringvip.js, pcfFont.js, qrcode.min.js
+ * 原始版本功能完全保留，增量增加：
+ * - 自动识别 Web 协议（6275...）和 APP 协议（0000ff01...）
+ * - APP 模式下的图片发送（支持 LZ77 压缩、A/B 面选择）
+ * - 不影响原有任何功能，新旧模式自动切换
+ * - 新增：根据协议动态显示/隐藏功能界面
+ * - 新增：同步时间按钮（无弹窗，仅 log）
  */
 
 // ==================== 全局变量 ====================
 let bleDevice, gattServer;
-let epdService, epdCharacteristic, txCharacteristic;
+let epdService, epdCharacteristic, txCharacteristic, cmdCharacteristic;
 let startTime, msgIndex, appVersion;
 let canvas, ctx, textDecoder;
 let paintManager, cropManager;
@@ -14,6 +18,8 @@ let paintManager, cropManager;
 // APP版本号
 const APP_VERSION = '2.1.0';
 const APP_BUILD_DATE = '2026-03-31';
+
+let ditherBrightness = 1.0;    // 亮度系数
 
 // 蓝牙命令定义（与固件保持一致）
 const EpdCmd = {
@@ -43,21 +49,25 @@ const EpdCmd = {
 const canvasSizes = [
     { name: '1.54_152_152', width: 152, height: 152 },
     { name: '1.54_200_200', width: 200, height: 200 },
+    { name: '2.13_104_212', width: 104, height: 212 },
     { name: '2.13_212_104', width: 212, height: 104 },
     { name: '2.13_250_122', width: 250, height: 122 },
     { name: '2.13_128_250', width: 128, height: 250 },
+    { name: '2.66_152_296', width: 152, height: 296 },//52810单独的
     { name: '2.66_296_152', width: 296, height: 152 },
     { name: '2.8_152_296', width: 152, height: 296 },//四色2.8寸
     { name: '2.9_296_128', width: 296, height: 128 },
     { name: '2.9_128_296', width: 128, height: 296 },//盒马2.9寸
     { name: '2.9_384_168', width: 384, height: 168 },
-    { name: '3.1_300_300', width: 300, height: 300 },
+    { name: '3.1_300_300', width: 304, height: 304 },
     { name: '3.5_384_184', width: 384, height: 184 },
+    { name: '3.7_240_416', width: 240, height: 416 },//3.7寸 第一代AI智屏壳
     { name: '3.7_416_240', width: 416, height: 240 },
     { name: '3.97_800_480', width: 800, height: 480 },
     { name: '3.98_768_552', width: 768, height: 552 },//3.98寸四色手机壳
     { name: '4.2_400_300', width: 400, height: 300 },
     { name: '5.79_792_272', width: 792, height: 272 },
+    { name: '5.81_720_256', width: 720, height: 256 },//海带屏
     { name: '5.83_600_448', width: 600, height: 448 },
     { name: '5.83_648_480', width: 648, height: 480 },
     { name: '7.4_800_480', width: 800, height: 480 },//SES7.4_GU140
@@ -68,8 +78,22 @@ const canvasSizes = [
     { name: '10.85_1360_480', width: 1360, height: 480 },
     { name: '11.6_960_640', width: 960, height: 640 },
     { name: '4E_600_400', width: 600, height: 400 },
-    { name: '7.3E6', width: 480, height: 800 }
+    { name: '7.3E6', width: 480, height: 800 }, 
+    { name: '7.3E6_800_480', width: 800, height: 480 }
 ];
+
+// ==================== 双协议支持 ====================
+// 在现有全局变量下方添加
+let appMtuNegotiated = false;
+
+let appModeEnabled = false;
+let currentEpdIndex = 1;
+let compressEnabled = false;
+let epdTypeForApp = 0x06;
+let imageDataA = null, imageDataB = null, currentImageDataForApp = null;
+// APP 模式专用：存储从主画布同步过来的图像数据
+let storedImageDataA = null;   // ImageData 对象
+let storedImageDataB = null;
 
 // ==================== 工具函数 ====================
 function hex2bytes(hex) {
@@ -94,6 +118,7 @@ function resetVariables() {
     epdService = null;
     epdCharacteristic = null;
     txCharacteristic = null;
+    cmdCharacteristic = null;
     msgIndex = 0;
     const logEl = document.getElementById("log");
     if (logEl) logEl.innerHTML = '';
@@ -119,10 +144,25 @@ async function write(cmd, data, withResponse = true) {
             payload.push(...data);
         }
         addLog(bytes2hex(payload), '⇑');
+        const dataBuffer = Uint8Array.from(payload);
+        
+        // ==============================================
+        // 🔥 核心兼容写法：自动适配所有浏览器/设备
+        // ==============================================
         if (withResponse) {
-            await epdCharacteristic.writeValueWithResponse(Uint8Array.from(payload));
+            // 带响应写入（兼容新老API）
+            if (epdCharacteristic.writeValueWithResponse) {
+                await epdCharacteristic.writeValueWithResponse(dataBuffer);
+            } else {
+                await epdCharacteristic.writeValue(dataBuffer);
+            }
         } else {
-            await epdCharacteristic.writeValueWithoutResponse(Uint8Array.from(payload));
+            // 不带响应写入（兼容新老API）
+            if (epdCharacteristic.writeValueWithoutResponse) {
+                await epdCharacteristic.writeValueWithoutResponse(dataBuffer);
+            } else {
+                await epdCharacteristic.writeValue(dataBuffer);
+            }
         }
         await sleep(WRITE_DELAY_MS);
         return true;
@@ -188,52 +228,41 @@ async function setDriver() {
     addLog("驱动配置已设置");
 }
 
-
-
-// 辅助函数：获取星期第一天设置
 function getWeekStart() {
-  const weekStartValue = document.getElementById('weekStart').value;
-  return weekStartValue !== null && weekStartValue !== '' ? parseInt(weekStartValue) : 1;
+    const weekStartValue = document.getElementById('weekStart').value;
+    return weekStartValue !== null && weekStartValue !== '' ? parseInt(weekStartValue) : 1;
 }
 
-// 辅助函数：构建时间数据包
 function buildTimeData(mode) {
-  const timestamp = new Date().getTime() / 1000;
-  return new Uint8Array([
-    (timestamp >> 24) & 0xFF,
-    (timestamp >> 16) & 0xFF,
-    (timestamp >> 8) & 0xFF,
-    timestamp & 0xFF,
-    -(new Date().getTimezoneOffset() / 60),
-    mode
-  ]);
+    const timestamp = new Date().getTime() / 1000;
+    return new Uint8Array([
+        (timestamp >> 24) & 0xFF,
+        (timestamp >> 16) & 0xFF,
+        (timestamp >> 8) & 0xFF,
+        timestamp & 0xFF,
+        -(new Date().getTimezoneOffset() / 60),
+        mode
+    ]);
 }
 
-// 辅助函数：发送时间同步命令
 async function sendTimeCommand(mode, modeName) {
-  const weekStart = getWeekStart();
-  const weekDays = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
-
-  // 先设置星期第一天
-  await write(EpdCmd.SET_WEEK_START, new Uint8Array([weekStart]));
-
-  // 发送时间数据
-  if (await write(EpdCmd.SET_TIME, buildTimeData(mode))) {
-    addLog(`${modeName}已启用！`);
-    addLog(`星期第一天已设置为：${weekDays[weekStart]}`);
-    addLog("屏幕刷新完成前请不要操作。");
-    return true;
-  }
-  return false;
+    const weekStart = getWeekStart();
+    const weekDays = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+    await write(EpdCmd.SET_WEEK_START, new Uint8Array([weekStart]));
+    if (await write(EpdCmd.SET_TIME, buildTimeData(mode))) {
+        addLog(`${modeName}已启用！`);
+        addLog(`星期第一天已设置为：${weekDays[weekStart]}`);
+        addLog("屏幕刷新完成前请不要操作。");
+        return true;
+    }
+    return false;
 }
 
 // 老款时钟模式 (仅适用于UC8179 7.5寸)
 async function syncTimeLegacy() {
-  if (!confirm('确认切换到老款时钟模式？\n\n⚠️ 警告：时钟模式会加速屏幕老化导致损坏！\n• 请勿长时间使用\n• 此模式仅适用于UC8179 7.5寸屏幕\n• 费电')) return;
-
-  await sendTimeCommand(3, '老款时钟模式');
+    if (!confirm('确认切换到老款时钟模式？\n\n⚠️ 警告：时钟模式会加速屏幕老化导致损坏！\n• 请勿长时间使用\n• 此模式仅适用于UC8179 7.5寸屏幕\n• 费电')) return;
+    await sendTimeCommand(3, '老款时钟模式');
 }
-
 
 async function syncTime(mode) {
     if (mode === 2 && !confirm("提醒：时钟模式目前使用全刷实现，此功能目前多用于修复老化屏残影问题，不建议长期开启，是否继续？")) return;
@@ -254,7 +283,27 @@ async function syncTime(mode) {
         addLog("时间已同步！");
         addLog("屏幕刷新完成前请不要操作。");
     }
-    await sendTimeCommand(mode, modeName);
+    await sendTimeCommand(mode, mode === 1 ? '日历模式' : '时钟模式');
+}
+
+// ==================== 新增：无弹窗同步时间 ====================
+async function syncTimeOnly() {
+    // 仅对 Web 模式有效，APP 模式下该按钮应被隐藏
+    const timestamp = Math.floor(Date.now() / 1000);
+    const data = new Uint8Array([
+        (timestamp >> 24) & 0xFF,
+        (timestamp >> 16) & 0xFF,
+        (timestamp >> 8) & 0xFF,
+        timestamp & 0xFF,
+        -(new Date().getTimezoneOffset() / 60),
+        1   // 日历模式（仅为时间同步，模式值随意）
+    ]);
+    const success = await write(EpdCmd.SET_TIME, data);
+    if (success) {
+        addLog(`✅ 已同步时间: ${new Date(timestamp * 1000).toLocaleString()}`);
+    } else {
+        addLog("❌ 时间同步失败");
+    }
 }
 
 async function clearScreen() {
@@ -326,9 +375,9 @@ function convertUC8159(blackWhiteData, redWhiteData) {
         let red = redWhiteData[i];
         for (let j = 0; j < 8; j++) {
             let data;
-            if ((red & 0x80) === 0) data = 0x04;      // red
-            else if ((black & 0x80) === 0) data = 0x00; // black
-            else data = 0x03;                          // white
+            if ((red & 0x80) === 0) data = 0x04;
+            else if ((black & 0x80) === 0) data = 0x00;
+            else data = 0x03;
             data = (data << 4) & 0xFF;
             black = (black << 1) & 0xFF;
             red = (red << 1) & 0xFF;
@@ -344,31 +393,207 @@ function convertUC8159(blackWhiteData, redWhiteData) {
     return payloadData;
 }
 
-// ==================== 发送图片 ====================
+// ==================== APP模式专用函数 ====================
+async function loadImageFromFile(file) {
+    return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = reject;
+        img.src = URL.createObjectURL(file);
+    });
+}
+
+
+async function sendimgAppMode() {
+    const epdIndex = parseInt(document.getElementById('abSelect')?.value || '1');
+    const compressEnabled = document.getElementById('compressEnable')?.checked || false;
+    const epdTypeVal = 0x06;  // 七色屏固定
+
+    addLog(`🔄 APP模式发送开始 (模式: ${epdIndex})`);
+
+    // 数据存在性检查（严格按照您的逻辑）
+    if (epdIndex === 1) { // A面
+        if (!storedImageDataA) {
+            addLog("❌ A面数据为空，请先点击「从主画布同步到 A 面」");
+            return;
+        }
+    } else if (epdIndex === 2) { // B面
+        if (!storedImageDataB) {
+            addLog("❌ B面数据为空，请先点击「从主画布同步到 B 面」");
+            return;
+        }
+    } else if (epdIndex === 3) { // A&B同显
+        if (!storedImageDataA) {
+            addLog("❌ A面数据为空，请先点击「从主画布同步到 A 面」");
+            return;
+        }
+    } else if (epdIndex === 7) { // A&B异显
+        if (!storedImageDataA || !storedImageDataB) {
+            addLog("❌ AB异显模式需要同时具备A面和B面数据，请分别同步");
+            return;
+        }
+    } else {
+        addLog("⚠️ 未知模式，默认为A面");
+        if (!storedImageDataA) {
+            addLog("❌ A面数据为空，请先同步A面");
+            return;
+        }
+    }
+
+    // 直接使用已同步的数据（已经过抖动处理）
+    const sourceImageDataA = storedImageDataA;
+    const sourceImageDataB = storedImageDataB;
+
+    // 转换为设备数据格式（无需再次抖动）
+    let dataA = null, dataB = null;
+    try {
+        if (sourceImageDataA) {
+            dataA = EpdFormat.convertWithType(epdTypeVal, canvas.width, canvas.height, sourceImageDataA, findClosestColor);
+        }
+        if (sourceImageDataB) {
+            dataB = EpdFormat.convertWithType(epdTypeVal, canvas.width, canvas.height, sourceImageDataB, findClosestColor);
+        }
+    } catch (e) {
+        addLog("❌ 格式转换失败: " + e.message);
+        console.error(e);
+        return;
+    }
+
+    // 根据模式组合最终数据
+    let finalData = null;
+    if (epdIndex === 1) {
+        finalData = dataA;
+        addLog(`单面模式（A面）：发送 A 面数据，长度 ${dataA ? dataA.length : 0} 字节`);
+    } else if (epdIndex === 2) {
+        finalData = dataB;
+        addLog(`单面模式（B面）：发送 B 面数据，长度 ${dataB ? dataB.length : 0} 字节`);
+    } else if (epdIndex === 3) {
+        finalData = dataA;
+        addLog(`同显模式：发送 A 面数据，长度 ${dataA ? dataA.length : 0} 字节`);
+    } else if (epdIndex === 7) {
+        if (!dataA || !dataB) {
+            addLog("❌ 异显模式数据转换失败，缺少A或B面数据");
+            return;
+        }
+        finalData = new Uint8Array(dataA.length + dataB.length);
+        finalData.set(dataA, 0);
+        finalData.set(dataB, dataA.length);
+        addLog(`异显模式：发送 A+B 面数据，总长度 ${finalData.length} 字节`);
+    } else {
+        addLog("⚠️ 未知模式，默认发送A面");
+        finalData = dataA;
+    }
+
+    if (!finalData) {
+        addLog("❌ 未生成有效的设备数据，请检查图像内容");
+        return;
+    }
+
+    // 发送图片
+    startTime = Date.now();
+    const statusEl = document.getElementById("status");
+    statusEl.parentElement.style.display = "block";
+
+    try {
+        AppProtocol.setEpdType(epdTypeVal);
+        AppProtocol.setEpdIndex(epdIndex);
+        AppProtocol.setCompress(compressEnabled);
+        AppProtocol.setProgressCallback((sent, total) => {
+            const elapsed = (Date.now() - startTime) / 1000;
+            setStatus(`发送图片: ${sent}/${total} 包, 用时 ${elapsed.toFixed(1)}s`);
+        });
+        AppProtocol.setCompleteCallback(() => {
+            if (bleDevice && bleDevice.gatt && bleDevice.gatt.connected) {
+                addLog("✅ APP模式传输完成（刷新等待时间长, 请耐心等待设备刷新）");
+            }
+        });
+
+        addLog(`准备发送图片，模式: 七色, 压缩: ${compressEnabled}, 驱动: 0x${epdTypeVal.toString(16)}`);
+        await AppProtocol.sendFullImage(finalData, 'sevenColor', epdTypeVal, compressEnabled);
+        const elapsed = (Date.now() - startTime) / 1000;
+        addLog(`✅ APP 模式发送完成！耗时: ${elapsed.toFixed(2)}s`);
+    } catch (e) {
+        addLog(`❌ APP 模式发送失败: ${e.message}`);
+        console.error(e);
+    } finally {
+        updateButtonStatus();
+        setTimeout(() => { statusEl.parentElement.style.display = "none"; }, 5000);
+    }
+}
+//交错处理抖动好的数据
+/**
+ * JD79660 屏幕数据交错重排函数
+ * 适配tsl0922驱动 3.98寸 768x552屏幕
+ * 逻辑行552行(0~551)，上下各276行交错映射物理行
+ * @param {Uint8Array} rawData 原始未重排四色图像数据，每字节4像素
+ * @returns {Uint8Array} 交错重排完成后的图像数据
+ */
+function JD79660JiaoCuoYuChuLi(rawData) {
+    // 1. 获取当前画布尺寸 匹配 canvasSizes 中 3.98_768_552
+    const sizeItem = canvasSizes.find(item => item.name === "3.98_768_552");
+    const W = sizeItem.width;  // 768
+    const H = sizeItem.height; // 552
+    const lineByteCount = W / 4; // 单行字节数 768/4=192
+    const halfLineCount = H / 2;   // 上下两半各276行
+
+    // 分配输出缓冲区，总长度和原始数据一致 W*H/4
+    const interleaveBuf = new Uint8Array(rawData.length);
+
+    // 遍历每一行逻辑行 (0 ~ 551)
+    for (let logicRow = 0; logicRow < H; logicRow++) {
+        // 计算当前逻辑行在原始数组的起始偏移
+        const rawLineOffset = logicRow * lineByteCount;
+        // 计算映射后的物理行
+        let physicalRow;
+        if (logicRow < halfLineCount) {
+            // 上半部分0~275 → 偶数物理行 0,2,4...550
+            physicalRow = logicRow * 2;
+        } else {
+            // 下半部分276~551 → 反向奇数行 551,549...1
+            const offset = logicRow - halfLineCount;
+            physicalRow = (H - 1) - 2 * offset;
+        }
+        // 物理行对应输出缓冲区偏移
+        const targetOffset = physicalRow * lineByteCount;
+        // 复制单行全部字节到交错缓冲区对应位置
+        for (let b = 0; b < lineByteCount; b++) {
+            interleaveBuf[targetOffset + b] = rawLineOffset + b < rawData.length ? rawData[rawLineOffset + b] : 0;
+        }
+    }
+    return interleaveBuf;
+}
+
+// ==================== 发送图片（支持双协议）====================
 async function sendimg() {
     if (cropManager.isCropMode()) {
         alert("请先完成图片裁剪！发送已取消。");
         return;
     }
 
-    // 检查是否有非图片模式的内容（课表、待办等）
     const hasSpecialContent = paintManager && (
         (paintManager.scheduleData && paintManager.scheduleData.length > 0) ||
         (paintManager.todoData && paintManager.todoData.length > 0) ||
         paintManager.cardData ||
         paintManager.wifiData
     );
+
+    if (appModeEnabled) {
+        await sendimgAppMode();
+        return;
+    }
+
+    // ========== 原始网页版发送逻辑 ==========
     if (hasSpecialContent) {
         addLog("特殊内容发送：重绘画布（禁用抖动/对比度，直接按渲染结果发送）");
         paintManager.redrawAll();
     } else {
-        // 普通图片模式：先执行抖动处理
         if (typeof convertDithering === 'function') convertDithering();
     }
 
     const canvasSizeVal = document.getElementById('canvasSize').value;
     const ditherMode = document.getElementById('ditherMode').value;
     const epdDriverSelect = document.getElementById('epddriver');
+    const epdDriverPreset = document.getElementById('driverPreset');
     const selectedOption = epdDriverSelect.options[epdDriverSelect.selectedIndex];
 
     if (selectedOption.getAttribute('data-size') !== canvasSizeVal && !confirm("警告：画布尺寸和驱动不匹配，是否继续？")) return;
@@ -382,15 +607,51 @@ async function sendimg() {
     const processedData = processImageData(imageData, ditherMode);
 
     updateButtonStatus(true);
-    await write(EpdCmd.INIT);  // 确保屏幕初始化
+    await write(EpdCmd.INIT);
 
-    // 使用CRC传输（固件版本>=0x20时）
     const useCRC = (appVersion >= 0x20) && typeof BleTransfer !== 'undefined';
     const transferFn = useCRC ? writeImageCRC : writeImage;
     if (useCRC) addLog("使用CRC校验传输模式");
 
-    if (ditherMode === 'fourColor') {
-        await transferFn(processedData, 'color');
+    if (ditherMode === 'sixColor') {
+        // 获取当前画布的图像数据（已经过抖动预处理）
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        // 提取六色索引（0-5）
+        const sixColorPalette = epdRealColors.sixColor; // 从 dithering.js 中获取
+        const indexArray = extractSixColorIndex(imageData, sixColorPalette);
+        // 生成两次波形数据
+        const wave1 = mapSixColorToWaveform(indexArray, canvas.width, canvas.height, true);
+        const wave2 = mapSixColorToWaveform(indexArray, canvas.width, canvas.height, false);
+        
+        startTime = Date.now();
+        const statusEl = document.getElementById("status");
+        statusEl.parentElement.style.display = "block";
+        updateButtonStatus(true);
+        
+        await write(EpdCmd.INIT);
+        
+        // 第一次传输 + 刷新
+        await writeImageCRC(wave1, 'bw');   // 或 writeImage，取决于是否支持 CRC
+        await write(EpdCmd.REFRESH);
+        
+        // 第二次传输 + 刷新
+        await writeImageCRC(wave2, 'bw');
+        await write(EpdCmd.REFRESH);
+        
+        updateButtonStatus();
+        const elapsed = (Date.now() - startTime) / 1000;
+        addLog(`E6 发送完成！耗时: ${elapsed}s`);
+        setStatus(`E6 发送完成！耗时: ${elapsed}s`);
+        setTimeout(() => { statusEl.parentElement.style.display = "none"; }, 5000);
+        return;
+    } else if (ditherMode === 'fourColor') {
+        if(epdDriverPreset.value == "tsl0922" && epdDriverSelect.value == "13"){
+            // JD79660 屏幕执行行交错重排
+            const interleaveData = JD79660JiaoCuoYuChuLi(processedData);
+            await transferFn(interleaveData, 'color');
+        }else{
+            await transferFn(processedData, 'color');
+        }
     } else if (ditherMode === 'threeColor') {
         const half = Math.floor(processedData.length / 2);
         const bwData = processedData.slice(0, half);
@@ -433,7 +694,6 @@ function downloadDataArray() {
         return;
     }
 
-    // 特殊内容模式时先重绘
     const hasSpecial = paintManager && (
         (paintManager.scheduleData && paintManager.scheduleData.length > 0) ||
         (paintManager.todoData && paintManager.todoData.length > 0) ||
@@ -457,6 +717,9 @@ function downloadDataArray() {
     for (let i = 0; i < hexLines.length; i += 16) {
         chunks.push(hexLines.slice(i, i + 16).join(', '));
     }
+    const epdDriverSelect = document.getElementById('epddriver');
+    const epdDriverPreset = document.getElementById('driverPreset');
+    if(epdDriverPreset.value == "tsl0922" && epdDriverSelect.value == "13") chunks = JD79660JiaoCuoYuChuLi(chunks);
 
     const colorModeCode = mode === 'sixColor' ? 0 : mode === 'fourColor' ? 1 : mode === 'blackWhiteColor' ? 2 : 3;
     const content = [
@@ -474,6 +737,14 @@ function downloadDataArray() {
     link.href = URL.createObjectURL(blob);
     link.click();
     URL.revokeObjectURL(link.href);
+}
+
+function downloadImage() {
+    // 将当前 canvas 内容保存为 PNG 文件，尺寸保持原样
+    const link = document.createElement('a');
+    link.download = 'epd_image.png';
+    link.href = canvas.toDataURL('image/png');
+    link.click();
 }
 
 function uploadDataArray() {
@@ -527,7 +798,6 @@ function uploadDataArray() {
                 });
                 const dataArray = new Uint8Array(numbers);
 
-                // 验证长度
                 let expected;
                 if (modeStr === "sixColor") expected = width * height;
                 else if (modeStr === "fourColor") expected = Math.ceil(width * height / 4);
@@ -538,7 +808,6 @@ function uploadDataArray() {
                     return;
                 }
 
-                // 更新画布尺寸
                 canvas.width = width;
                 canvas.height = height;
                 const sizeSelect = document.getElementById('canvasSize');
@@ -583,7 +852,7 @@ function updateButtonStatus(forceDisabled = false) {
     document.getElementById("setDriverbutton").disabled = disabled;
     document.getElementById("syncholidaybutton").disabled = disabled;
     const testBtn = document.querySelector('button[onclick="syncAndShowCalendar()"]');
-    if (testBtn) testBtn.disabled = disabled;
+    if(testBtn) testBtn.disabled = disabled;
 }
 
 function disconnect() {
@@ -593,48 +862,141 @@ function disconnect() {
     document.getElementById("connectbutton").innerHTML = '连接';
 }
 
-// ==================== 蓝牙连接相关 ====================
+// ==================== 根据协议显示/隐藏功能区 ====================
+function updateUIBasedOnProtocol() {
+    const webOnlyIds = ['calendarmodebutton','clockmodebutton','clearscreenbutton','syncholidaybutton','importholidaybutton','holidayhelpbutton','testTimestamp','testYear','testMonth'];
+    const appOnlyIds = ['abSelectGroup','compressOptionGroup','doubleImagePanel'];
+    const protocolSpan = document.getElementById('protocolStatus');
+    if (protocolSpan) {
+        if (appModeEnabled) {
+            protocolSpan.textContent = 'APP 模式';
+            protocolSpan.style.color = '#4CAF50';
+        } else {
+            protocolSpan.textContent = '网页模式 (Web)';
+            protocolSpan.style.color = '#2196F3';
+        }
+    }
+
+    if (appModeEnabled) {
+        // 隐藏 Web 特有功能
+        webOnlyIds.forEach(id => {
+            const el = document.getElementById(id);
+            if (el) {
+                if (el.tagName === 'BUTTON' || el.tagName === 'INPUT' || el.tagName === 'SELECT') {
+                    el.disabled = true;
+                } else {
+                    el.style.display = 'none';
+                }
+            }
+        });
+        // 显示 APP 特有功能
+        appOnlyIds.forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.style.display = '';
+        });
+        //显示图像颜色和抖动操作栏
+        const imagePanel = document.getElementById('image-panel');
+        const imageModeBtn = document.getElementById('image-mode');
+        if (imagePanel && imagePanel.style.display === 'none') {
+            imagePanel.style.display = '';
+            if (imageModeBtn) imageModeBtn.classList.add('active');
+        }
+
+        // 查找包含 #testYear 的 .flex-container.debug 并隐藏（不使用 :has 选择器）
+        const testYearElement = document.getElementById('testYear');
+        if (testYearElement) {
+            let container = testYearElement.closest('.flex-container.debug');
+            if (container) container.style.display = 'none';
+        }
+        // 隐藏残影消除相关区域
+        const ghostingCyclesElement = document.getElementById('ghostingCycles');
+        if (ghostingCyclesElement) {
+            let container = ghostingCyclesElement.closest('.flex-container.debug');
+            if (container) container.style.display = 'none';
+        }
+    } else {
+        // Web 模式：恢复所有功能
+        webOnlyIds.forEach(id => {
+            const el = document.getElementById(id);
+            if (el) {
+                if (el.tagName === 'BUTTON' || el.tagName === 'INPUT' || el.tagName === 'SELECT') {
+                    el.disabled = false;
+                } else {
+                    el.style.display = '';
+                }
+            }
+        });
+        appOnlyIds.forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.style.display = 'none';
+        });
+
+        // 恢复假期测试区域
+        const testYearElement = document.getElementById('testYear');
+        if (testYearElement) {
+            let container = testYearElement.closest('.flex-container.debug');
+            if (container) container.style.display = '';
+        }
+        // 恢复残影消除区域
+        const ghostingCyclesElement = document.getElementById('ghostingCycles');
+        if (ghostingCyclesElement) {
+            let container = ghostingCyclesElement.closest('.flex-container.debug');
+            if (container) container.style.display = '';
+        }
+    }
+    //增加对 APP 模式状态栏的显示
+    const statusBar = document.getElementById('appModeStatusBar');
+    if (statusBar) {
+        if (appModeEnabled) {
+            statusBar.style.display = 'block';
+            statusBar.innerHTML = `📌 APP 模式：当前画布尺寸 ${canvas.width}x${canvas.height} | A面${storedImageDataA ? '已设置' : '未设置'} | B面${storedImageDataB ? '已设置' : '未设置'}`;
+        } else {
+            statusBar.style.display = 'none';
+        }
+    }
+}
+
+// ==================== 蓝牙连接相关（自动检测协议）====================
 async function filterConnect() {
     await preConnect(true, true);
 }
 
 async function preConnect(useFilter = false, forceNew = false) {
     if (gattServer && gattServer.connected) {
-        if (bleDevice && bleDevice.gatt.connected) bleDevice.gatt.disconnect();
-        if (!forceNew) return;
-        await sleep(300);
+    	if (bleDevice && bleDevice.gatt.connected) bleDevice.gatt.disconnect();
+    	if (!forceNew) return; await sleep(300);
     }
     resetVariables();
-
     try {
         const filterInput = document.getElementById('blenamefilter');
         const filterValue = filterInput?.value.trim();
         if (filterInput) filterInput.blur();
-
-        const options = { optionalServices: ['62750001-d828-918d-fb46-b6c11c675aec'] };
+        const options = {
+        	optionalServices: [
+        		'62750001-d828-918d-fb46-b6c11c675aec', 
+        		'0000ff01-0000-1000-8000-00805f9b34fb'
+        ] };
         if (useFilter && filterValue && filterValue.length > 0) {
             const prefix = filterValue.toUpperCase();
-            options.filters = [{ namePrefix: 'NRF_EPD_' + prefix }, { namePrefix: 'EPD_' + prefix }];
-            addLog(`按名称过滤: NRF_EPD_${prefix} 或 EPD_${prefix}`);
+            options.filters = [{ namePrefix: 'NRF_EPD_' + prefix }, { namePrefix: 'EPD_' + prefix },{ namePrefix: 'YSBadge2'}];
+            addLog(`按名称过滤: NRF_EPD_${prefix} 或 EPD_${prefix} 或 YSBadge2`);
         } else {
-            options.acceptAllDevices = true;
+        	options.acceptAllDevices = true;
         }
-
         bleDevice = await navigator.bluetooth.requestDevice(options);
+        addLog(`已选择设备: ${bleDevice.name || bleDevice.id}`);
     } catch (e) {
-        if (e.name === 'NotFoundError' || (e.message && e.message.includes('User cancelled'))) {
-            addLog("已取消设备选择。");
-        } else {
-            console.error(e);
-            if (e.message) addLog("requestDevice: " + e.message);
-            addLog("请检查蓝牙是否已开启，且使用的浏览器支持蓝牙！建议使用以下浏览器：");
+        if (e.name === 'NotFoundError' || (e.message && e.message.includes('User cancelled'))) addLog("已取消设备选择。");
+        else {
+        	console.error(e); 
+        	if (e.message) addLog("requestDevice: " + e.message); 
+        	addLog("请检查蓝牙是否已开启，且使用的浏览器支持蓝牙！建议使用以下浏览器：");
             addLog("• 电脑: Chrome/Edge");
             addLog("• Android: Chrome/Edge");
             addLog("• iOS: Bluefy 浏览器");
         }
         return;
     }
-
     bleDevice.addEventListener('gattserverdisconnected', disconnect);
     setTimeout(async () => { await connect(); }, 300);
 }
@@ -646,15 +1008,150 @@ async function reConnect() {
     setTimeout(async () => { await connect(); }, 300);
 }
 
+async function connect() {
+    if (!bleDevice || epdCharacteristic) return;
+    try {
+        addLog("正在连接: " + bleDevice.name);
+        gattServer = await bleDevice.gatt.connect();
+        addLog("  找到 GATT Server");
+        // 先尝试 Web 协议
+        try {
+            epdService = await gattServer.getPrimaryService('62750001-d828-918d-fb46-b6c11c675aec');
+            addLog("  找到 EPD Service (Web 协议)");
+            epdCharacteristic = await epdService.getCharacteristic('62750002-d828-918d-fb46-b6c11c675aec');
+            addLog("  找到 RX Characteristic");
+            txCharacteristic = await epdService.getCharacteristic('62750003-d828-918d-fb46-b6c11c675aec');
+            addLog("  找到 TX Characteristic");
+            await epdCharacteristic.startNotifications();
+            epdCharacteristic.addEventListener('characteristicvaluechanged', (event) => { handleNotify(event.target.value, msgIndex++); });
+            addLog("  通知已开启");
+            await sleep(50);
+            appModeEnabled = false;
+            addLog("📡 协议模式: 网页模式");
+        } catch (e) {
+            addLog("Web 协议识别失败，尝试 APP 协议...");
+            try {
+                epdService = await gattServer.getPrimaryService('0000ff01-0000-1000-8000-00805f9b34fb');
+                addLog("  找到 EPD Service (APP 协议)");
+                cmdCharacteristic = await epdService.getCharacteristic('0000ff03-0000-1000-8000-00805f9b34fb');
+                addLog("  找到 WriteCMD Characteristic (0000ff03)");
+                epdCharacteristic = await epdService.getCharacteristic('0000ff02-0000-1000-8000-00805f9b34fb');
+                addLog("  找到 WritePic Characteristic (0000ff02)");
+                txCharacteristic = await epdService.getCharacteristic('0000ff04-0000-1000-8000-00805f9b34fb');
+                addLog("  找到 Notify Characteristic (0000ff04)");
+
+                try { 
+                    await txCharacteristic.startNotifications(); 
+                    txCharacteristic.addEventListener('characteristicvaluechanged', (event) => { 
+                        handleNotify(event.target.value, msgIndex++); 
+                    }); 
+                    addLog("  通知已开启");
+                } catch(e2){ 
+                    addLog("  通知开启失败（不影响写操作）: "+e2.message);
+                }
+                appModeEnabled = true;
+                addLog("📡 协议模式: APP 模式");
+
+                if (typeof AppProtocol !== 'undefined') {
+                    AppProtocol.setCharacteristics(cmdCharacteristic, epdCharacteristic);
+                    AppProtocol.setNotifyCharacteristic(txCharacteristic);   // 新增这一行
+                    AppProtocol.setLogCallback(addLog);   // 添加这一行
+                    
+                    // ========== MTU 协商（大幅提升速度） ==========
+                    let actualMtu = 23;
+                    try {
+                        // 请求 MTU = 256
+                        await gattServer.requestMTU(256);
+                        addLog("  已请求 MTU=256");
+                        await sleep(500);
+                        // 获取协商后的实际 MTU（不同浏览器位置不同）
+                         if (gattServer.mtu) {
+                             actualMtu = gattServer.mtu;
+                             addLog(`  协商实际 MTU (gattServer.mtu) = ${actualMtu}`);
+                          } else if (cmdCharacteristic.service.device.gatt && cmdCharacteristic.service.device.gatt.mtu) {
+                              actualMtu = cmdCharacteristic.service.device.gatt.mtu;
+                              addLog(`  协商实际 MTU (device.gatt.mtu) = ${actualMtu}`);
+                          } else {
+                              addLog(`  ⚠️ 无法获取实际 MTU，使用默认 23`);
+                          }
+                    } catch(mtuErr) {
+                         addLog(`  MTU 协商失败: ${mtuErr.message}，使用默认 23`);
+                    }
+                    // 关键：将 MTU 应用到 AppProtocol（负载大小 = MTU - 3）
+                    AppProtocol.setMtuSize(actualMtu);
+                    addLog(`  ✅ APP模式数据包负载大小 = ${actualMtu - 3} 字节`);
+                    
+                    // 强制设置七色屏驱动（保持不变）
+                    const epdDriverSelect = document.getElementById('epddriver');
+                    // 强制添加并选择 0x06 七色驱动
+                    let option = Array.from(epdDriverSelect.options).find(opt => opt.value === 'FF');
+                    if (!option) {
+                        option = document.createElement('option');
+                        option.value = 'FF';
+                        option.setAttribute('data-color', 'sevenColor');
+                        option.setAttribute('data-size', '7.3E6_800_480');
+                        option.text = '7.3寸 (七色, Spectra 6)';
+                        epdDriverSelect.appendChild(option);
+                    }
+                    epdDriverSelect.value = 'FF';
+                    const ditherModeSelect = document.getElementById('ditherMode');
+                    if (ditherModeSelect) ditherModeSelect.value = 'sevenColor';
+                    const canvasSizeSelect = document.getElementById('canvasSize');
+                    if (canvasSizeSelect) canvasSizeSelect.value = '7.3E6_800_480';
+                    updateCanvasSize();
+                    addLog("✅ APP 模式：已强制设置为七色 7.3 寸屏幕 (Spectra 6)");
+                    AppProtocol.setEpdType(0x06);
+                    const abSelect = document.getElementById('abSelect');
+                    AppProtocol.setEpdIndex(abSelect ? parseInt(abSelect.value) : 1);
+                    const compressCheck = document.getElementById('compressEnable');
+                    AppProtocol.setCompress(compressCheck ? compressCheck.checked : false);
+                    addLog("  AppProtocol 初始化完成");
+                } else { addLog("  警告：AppProtocol 未加载，APP 模式无法发送图片"); }
+            } catch (e2) { throw new Error("无法识别设备协议，请确认设备固件是否支持"); }
+        }
+        updateUIBasedOnProtocol();
+        if (!appModeEnabled) {
+            try { const versionData = await txCharacteristic.readValue(); appVersion = versionData.getUint8(0); addLog(`固件版本: 0x${appVersion.toString(16)}`); addLog(`APP版本: v${APP_VERSION} (${APP_BUILD_DATE})`); } catch(e){ appVersion=0x15; }
+            if (typeof BleTransfer !== 'undefined') BleTransfer.init();
+            await write(EpdCmd.INIT);
+        } else {
+            appVersion = 0x20;
+            addLog("APP 模式：固件版本假定为 0x20");
+        }
+        if (!appModeEnabled && appVersion < 0x16) {
+            const oldURL = "https://tsl0922.github.io/EPD-nRF5/v1.5";
+            alert("!!!注意!!!\n当前固件版本过低，可能无法正常使用部分功能，建议升级到最新版本。");
+            if (confirm('是否访问旧版本上位机？')) location.href = oldURL;
+            setTimeout(()=> addLog(`如遇到问题，可访问旧版本上位机: ${oldURL}`), 500);
+        }
+        document.getElementById("connectbutton").innerHTML = '断开';
+        updateButtonStatus();
+        addLog("✅ 连接成功，可以发送指令或图片");
+    } catch (e) {
+        console.error(e);
+        if (e.message) addLog("connect: " + e.message);
+        disconnect();
+        return;
+    }
+}
+
 function handleNotify(value, idx) {
     const data = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
 
-    // CRC传输模块处理
+    // APP 模式：Notify 用于 CRC 传输的 ACK/状态，或者忽略
+    if (appModeEnabled) {
+        // 如果有 CRC 传输模块，让其处理（BleTransfer 未在 APP 模式使用，但保留以防万一）
+        return;
+    }
+
+    // ========== 以下仅 Web 协议 ==========
+    // CRC 传输处理
     if (data.length >= 1 && (data[0] === 0xA0 || data[0] === 0xA1)) {
         if (typeof BleTransfer !== 'undefined') BleTransfer.handleNotification(value);
         return;
     }
 
+    // idx === 0: 设备主动上报配置（仅 Web 协议）
     if (idx === 0) {
         addLog(`收到配置：${bytes2hex(data)}`);
         const epdpins = document.getElementById("epdpins");
@@ -664,6 +1161,7 @@ function handleNotify(value, idx) {
         epddriver.value = bytes2hex(data.slice(7, 8));
         updateDitcherOptions();
     } else {
+        // 普通文本消息
         if (!textDecoder) textDecoder = new TextDecoder();
         const msg = textDecoder.decode(data);
         addLog(msg, '⇓');
@@ -677,61 +1175,6 @@ function handleNotify(value, idx) {
             addLog(`本地时间: ${new Date().toLocaleString()}`);
         }
     }
-}
-
-async function connect() {
-    if (!bleDevice || epdCharacteristic) return;
-    try {
-        addLog("正在连接: " + bleDevice.name);
-        gattServer = await bleDevice.gatt.connect();
-        addLog("  找到 GATT Server");
-        epdService = await gattServer.getPrimaryService('62750001-d828-918d-fb46-b6c11c675aec');
-        addLog("  找到 EPD Service");
-        epdCharacteristic = await epdService.getCharacteristic('62750002-d828-918d-fb46-b6c11c675aec');
-        addLog("  找到 RX Characteristic");
-        txCharacteristic = await epdService.getCharacteristic('62750003-d828-918d-fb46-b6c11c675aec');
-        addLog("  找到 TX Characteristic");
-    } catch (e) {
-        console.error(e);
-        if (e.message) addLog("connect: " + e.message);
-        disconnect();
-        return;
-    }
-
-    try {
-        const versionData = await txCharacteristic.readValue();
-        appVersion = versionData.getUint8(0);
-        addLog(`固件版本: 0x${appVersion.toString(16)}`);
-        addLog(`APP版本: v${APP_VERSION} (${APP_BUILD_DATE})`);
-    } catch (e) {
-        console.error(e);
-        appVersion = 0x15;
-    }
-
-    if (appVersion < 0x16) {
-        const oldURL = "https://tsl0922.github.io/EPD-nRF5/v1.5";
-        alert("!!!注意!!!\n当前固件版本过低，可能无法正常使用部分功能，建议升级到最新版本。");
-        if (confirm('是否访问旧版本上位机？')) location.href = oldURL;
-        setTimeout(() => {
-            addLog(`如遇到问题，可访问旧版本上位机: ${oldURL}`);
-        }, 500);
-    }
-
-    try {
-        await epdCharacteristic.startNotifications();
-        epdCharacteristic.addEventListener('characteristicvaluechanged', (event) => {
-            handleNotify(event.target.value, msgIndex++);
-        });
-        addLog("  通知已开启");
-    } catch (e) {
-        console.error(e);
-        if (e.message) addLog("startNotifications: " + e.message);
-    }
-
-    await write(EpdCmd.INIT);
-    if (typeof BleTransfer !== 'undefined') BleTransfer.init();
-    document.getElementById("connectbutton").innerHTML = '断开';
-    updateButtonStatus();
 }
 
 // ==================== 日志和状态 ====================
@@ -856,6 +1299,24 @@ function clearCanvas() {
 // ==================== 抖动处理（带防抖）====================
 let _pendingDitherJob = null;
 
+/**
+ * 调整亮度（整体偏移）
+ * @param {ImageData} imageData 图像数据
+ * @param {number} brightness  亮度系数，范围 0.5～1.5，1.0 表示不变
+ * @returns {ImageData} 处理后的图像数据
+ */
+function adjustBrightness(imageData, brightness) {
+    const data = imageData.data;
+    const offset = (brightness - 1) * 128;   // 亮度偏移量，范围 -64～+64
+    if (Math.abs(offset) < 0.5) return imageData;
+    for (let i = 0; i < data.length; i += 4) {
+        data[i]     = Math.min(255, Math.max(0, data[i]     + offset));
+        data[i + 1] = Math.min(255, Math.max(0, data[i + 1] + offset));
+        data[i + 2] = Math.min(255, Math.max(0, data[i + 2] + offset));
+    }
+    return imageData;
+}
+
 function scheduleConvertDithering() {
     if (_pendingDitherJob) {
         if (_pendingDitherJob.type === 'idle' && typeof cancelIdleCallback === 'function') {
@@ -876,8 +1337,56 @@ function scheduleConvertDithering() {
     }
 }
 
+/**
+ * 对 ImageData 执行完整的预处理（对比度、亮度、抖动）
+ * @param {ImageData} imageData 
+ * @param {Object} options 可选覆盖参数，若不传则从 UI 读取
+ * @returns {ImageData} 处理后的 ImageData
+ */
+function processImageDataWithUI(imageData, options = {}) {
+    const contrast = options.contrast !== undefined ? options.contrast : parseFloat(document.getElementById('ditherContrast').value);
+    const brightness = options.brightness !== undefined ? options.brightness : parseFloat(document.getElementById('ditherBrightness').value);
+    const alg = options.alg || document.getElementById('ditherAlg').value;
+    const strength = options.strength !== undefined ? options.strength : parseFloat(document.getElementById('ditherStrength').value);
+    const colorMode = options.colorMode || document.getElementById('ditherMode').value;
+    const useLegacy = document.getElementById('useLegacyDither')?.checked || false;
+    
+    let processed = new ImageData(new Uint8ClampedArray(imageData.data), imageData.width, imageData.height);
+    if (!isNaN(contrast)) processed = adjustContrast(processed, contrast);
+    if (!isNaN(brightness) && brightness !== 1.0) processed = adjustBrightness(processed, brightness);
+    if (alg !== 'none') {
+        // 注意：ditherImage 会直接修改传入的 imageData，我们传入一个副本
+        processed = ditherImage(processed, alg, strength, colorMode);
+    }
+    return processed;
+}
+/**
+ * 将当前主画布内容保存为指定面的 ImageData
+ * @param {'A'|'B'} side 
+ */
+function syncCurrentCanvasToSide(side) {
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    if (side === 'A') {
+        storedImageDataA = imageData;
+        document.getElementById('aStatusLabel').innerText = `已同步 (${canvas.width}x${canvas.height})`;
+        addLog(`✅ 已将当前画布内容同步到 A 面（尺寸 ${canvas.width}x${canvas.height}）`);
+        // 可选：更新预览（如果用户勾选了“实时预览”）
+    } else {
+        storedImageDataB = imageData;
+        document.getElementById('bStatusLabel').innerText = `已同步 (${canvas.width}x${canvas.height})`;
+        addLog(`✅ 已将当前画布内容同步到 B 面（尺寸 ${canvas.width}x${canvas.height}）`);
+    }
+    // 更新底部协议状态栏中的 A/B 面状态
+    updateUIBasedOnProtocol();
+    // 若处于 AB 异显模式，可自动勾选启用抖动（视觉反馈）
+    const abSelect = document.getElementById('abSelect');
+    if (abSelect && abSelect.value === '7') {
+        document.getElementById('ditherEnable').checked = true;
+    }
+}
+
 function convertDithering() {
-    // 如果是特殊模式（课表、待办等），不进行抖动
+	// 如果是特殊模式（课表、待办等），不进行抖动
     const hasSpecial = paintManager && (
         (paintManager.scheduleData && paintManager.scheduleData.length > 0) ||
         (paintManager.todoData && paintManager.todoData.length > 0) ||
@@ -894,10 +1403,21 @@ function convertDithering() {
         paintManager.redrawLineSegments();
     }
 
-    const contrast = parseFloat(document.getElementById('ditherContrast').value);
+    // 1. 获取当前画布数据
     const current = ctx.getImageData(0, 0, canvas.width, canvas.height);
     let imgData = new ImageData(new Uint8ClampedArray(current.data), current.width, current.height);
-    adjustContrast(imgData, contrast);
+    // 2. 亮度调整
+    const brightness = parseFloat(document.getElementById('ditherBrightness').value);
+    if (!isNaN(brightness) && brightness !== 1.0) {
+        imgData = adjustBrightness(imgData, brightness);
+    }
+    // 3. 对比度调整
+    const contrast = parseFloat(document.getElementById('ditherContrast').value);
+    if (!isNaN(contrast)) {
+        imgData = adjustContrast(imgData, contrast);
+    }
+    //adjustContrast(imgData, contrast);
+    // 4. 抖动处理
     const alg = document.getElementById('ditherAlg').value;
     const strength = parseFloat(document.getElementById('ditherStrength').value);
     const mode = document.getElementById('ditherMode').value;
@@ -1150,7 +1670,7 @@ async function testCalendarJump(mode) {
     }
 }
 
-// ==================== 编辑器初始化 ====================
+// ==================== 编辑器初始化（保持不变）====================
 function initImageEditor() {
     const imageModeBtn = document.getElementById('image-mode');
     const imagePanel = document.getElementById('image-panel');
@@ -1228,7 +1748,6 @@ function initScheduleEditor() {
                     paintManager.redrawAll();
                 }
             } else {
-                // 显示时刷新编辑器表格
                 if (typeof renderScheduleEditorTable === 'function') renderScheduleEditorTable();
             }
         });
@@ -1474,6 +1993,217 @@ function initWifiEditor() {
     if (typeof scheduleWifiCanvasPreviewUpdate === 'function') scheduleWifiCanvasPreviewUpdate();
 }
 
+// 预览单张图片到主画布（应用当前抖动）
+async function previewImageOnCanvas(file) {
+    const img = await loadImageFromFile(file);
+    const offCanvas = document.createElement('canvas');
+    offCanvas.width = canvas.width;
+    offCanvas.height = canvas.height;
+    const offCtx = offCanvas.getContext('2d');
+    offCtx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    let imageData = offCtx.getImageData(0, 0, canvas.width, canvas.height);
+    
+    if (document.getElementById('ditherEnable')?.checked) {
+        const alg = document.getElementById('ditherAlg').value;
+        const strength = parseFloat(document.getElementById('ditherStrength').value);
+        const contrast = parseFloat(document.getElementById('ditherContrast').value);
+        const mode = document.getElementById('ditherMode').value;
+        let temp = new ImageData(new Uint8ClampedArray(imageData.data), canvas.width, canvas.height);
+        temp = adjustContrast(temp, contrast);
+        temp = ditherImage(temp, alg, strength, mode);
+        imageData.data.set(temp.data);
+    }
+    ctx.putImageData(imageData, 0, 0);
+    if (paintManager) paintManager.saveToHistory();
+    addLog(`预览完成（尺寸：${canvas.width}x${canvas.height}）`);
+}
+
+// 合并预览 A/B 面（左右并排）
+async function previewBothOnCanvas(fileA, fileB) {
+    const imgA = await loadImageFromFile(fileA);
+    const imgB = await loadImageFromFile(fileB);
+    const halfWidth = canvas.width / 2;
+    const offCanvas = document.createElement('canvas');
+    offCanvas.width = canvas.width;
+    offCanvas.height = canvas.height;
+    const offCtx = offCanvas.getContext('2d');
+    offCtx.drawImage(imgA, 0, 0, halfWidth, canvas.height);
+    offCtx.drawImage(imgB, halfWidth, 0, halfWidth, canvas.height);
+    let imageData = offCtx.getImageData(0, 0, canvas.width, canvas.height);
+    
+    if (document.getElementById('ditherEnable')?.checked) {
+        const alg = document.getElementById('ditherAlg').value;
+        const strength = parseFloat(document.getElementById('ditherStrength').value);
+        const contrast = parseFloat(document.getElementById('ditherContrast').value);
+        const mode = document.getElementById('ditherMode').value;
+        let temp = new ImageData(new Uint8ClampedArray(imageData.data), canvas.width, canvas.height);
+        temp = adjustContrast(temp, contrast);
+        temp = ditherImage(temp, alg, strength, mode);
+        imageData.data.set(temp.data);
+    }
+    ctx.putImageData(imageData, 0, 0);
+    if (paintManager) paintManager.saveToHistory();
+    addLog("合并预览完成（左A右B）");
+}
+
+
+/**
+ * 驱动预设配置模块
+ * 说明：通过选择不同的预设，动态更新 epddriver 下拉列表，
+ *      并自动触发 updateDitcherOptions() 更新颜色模式/画布尺寸。
+ *      方便后续添加其他驱动配置，只需在 DRIVER_PRESETS 数组中增加一项即可。
+ */
+
+// 预设驱动选项模板（HTML 字符串）
+const DRIVER_PRESETS = [
+    {
+        id: "dongshan",
+        name: "东山驱动",
+        // 选项HTML（与原 QuDong_DongShan 完全一致）
+        optionsHtml: `
+                    <option value="1d" data-color="blackWhiteColor" data-size="1.54_152_152">1.54寸 (黑白低分, UC8176)</option>
+                    <option value="17" data-color="threeColor" data-size="1.54_200_200">1.54寸 (三色, UC8176)</option>
+                    <option value="19" data-color="blackWhiteColor" data-size="2.13_104_212">2.13寸低分(黑白, SSD1619)</option>
+                    <option value="0e" data-color="blackWhiteColor" data-size="2.13_128_250">2.13寸 (黑白, SSD1619)</option>
+                    <option value="0f" data-color="threeColor" data-size="2.13_128_250">2.13寸 (三色, SSD1619)</option>
+                    <option value="13" data-color="fourColor" data-size="2.8_152_296">2.8寸 (四色, JD79668)</option>
+                    <option value="11" data-color="blackWhiteColor" data-size="2.9_128_296">2.9寸 (黑白, SSD1619)</option>
+                    <option value="12" data-color="threeColor" data-size="2.9_128_296">2.9寸 (三色, SSD1619)</option>
+                    <option value="1b" data-color="blackWhiteColor" data-size="2.9_128_296">2.9寸 (黑白, SSD1680)</option>
+                    <option value="10" data-color="fourColor" data-size="3.1_300_300">3.1寸 (四色, JD79665)</option>
+                    <option value="18" data-color="threeColor" data-size="3.7_416_240">3.7寸 (三色, AI智屏壳)</option>
+                    <option value="1c" data-color="fourColor" data-size="3.97_800_480">3.97寸 (四色, 方角四色屏)</option>
+                    <option value="14" data-color="fourColor" data-size="3.98_768_552">3.98寸 (四色, 华为手机壳A0)</option>
+                    <option value="15" data-color="fourColor" data-size="3.98_768_552">3.98寸 (四色, 华为手机壳A1)</option>
+                    <option value="01" data-color="blackWhiteColor" data-size="4.2_400_300">4.2寸 (黑白, UC8176)</option>
+                    <option value="02" data-color="threeColor" data-size="4.2_400_300" selected>4.2寸 (三色, UC8176)</option>
+                    <option value="16" data-color="threeColor" data-size="4.2_400_300">4.2寸 (三色, SES_4.2BWR_GL340)</option>
+                    <option value="03" data-color="blackWhiteColor" data-size="4.2_400_300">4.2寸 (黑白, SSD1619)</option>
+                    <option value="04" data-color="threeColor" data-size="4.2_400_300">4.2寸 (三色, SSD1619)</option>
+                    <option value="05" data-color="fourColor" data-size="4.2_400_300">4.2寸 (四色, JD79668)</option>
+                    <option value="1e" data-color="blackWhiteColor" data-size="5.83_648_480">5.83寸 (黑白, JD79583)</option>
+                    <option value="0d" data-color="fourColor" data-size="5.83_648_480">5.83寸 (四色, JD79665)</option>
+                    <option value="FF" data-color="sevenColor" data-size="7.3E6_800_480">7.3寸 (七色, Spectra 6)</option>
+                    <option value="2b" data-color="threeColor" data-size="7.4_800_480">7.4寸 (三色, SES7.4_GU140)</option>
+                    <option value="06" data-color="blackWhiteColor" data-size="7.5_800_480">7.5寸 (黑白, UC8179)</option>
+                    <option value="07" data-color="threeColor" data-size="7.5_800_480">7.5寸 (三色, UC8179)</option>
+                    <option value="0c" data-color="fourColor" data-size="7.5_800_480">7.5寸 (四色, JD79665)</option>
+                    <option value="08" data-color="blackWhiteColor" data-size="7.5_640_384">7.5寸低分 (黑白, UC8159)</option>
+                    <option value="09" data-color="threeColor" data-size="7.5_640_384">7.5寸低分 (三色, UC8159)</option>
+                    <option value="0a" data-color="blackWhiteColor" data-size="7.5_880_528">7.5寸HD (黑白, SSD1677)</option>
+                    <option value="0b" data-color="threeColor" data-size="7.5_880_528">7.5寸HD (三色, SSD1677)</option>
+        `
+    },
+    {
+        id: "tsl0922",
+        name: "TSL0922驱动",
+        // 选项HTML（与原 QuDong_Tsl0922 完全一致）
+        optionsHtml: `
+                    <option value="13" data-color="fourColor" data-size="3.98_768_552">3.98寸A0 (四色, JD79665)</option>
+                    <option value="14" data-color="fourColor" data-size="3.98_768_552">3.98寸A1 (四色, JD79665)</option>
+                    <option value="01" data-color="blackWhiteColor" data-size="4.2_400_300">4.2寸 (黑白, UC8176)</option>
+                    <option value="03" data-color="threeColor" data-size="4.2_400_300"  selected>4.2寸 (三色, UC8176)</option>
+                    <option value="04" data-color="blackWhiteColor" data-size="4.2_400_300">4.2寸 (黑白, SSD1619)</option>
+                    <option value="02" data-color="threeColor" data-size="4.2_400_300">4.2寸 (三色, SSD1619)</option>
+                    <option value="17" data-color="threeColor" data-size="4.2_400_300">4.2寸 (黑白, SSD1683)</option>
+                    <option value="16" data-color="threeColor" data-size="4.2_400_300">4.2寸 (三色, SSD1683)</option>
+                    <option value="05" data-color="fourColor" data-size="4.2_400_300">4.2寸 (四色, JD79668)</option>
+                    <option value="28" data-color="blackWhiteColor" data-size="5.81_720_256">5.81寸 (黑白, 龙亭)</option>
+                    <option value="29" data-color="threeColor" data-size="5.81_720_256">5.81寸 (三色, 龙亭)</option>
+                    <option value="19" data-color="blackWhiteColor" data-size="5.83_648_480">5.83寸 (黑白, UC8179)</option>
+                    <option value="18" data-color="threeColor" data-size="5.83_648_480">5.83寸 (三色, UC8179)</option>
+                    <option value="0f" data-color="blackWhiteColor" data-size="5.83_648_480">5.83寸 (黑白, JD79686)</option>
+                    <option value="0e" data-color="threeColor" data-size="5.83_648_480">5.83寸 (三色, JD79686)</option>
+                    <option value="0d" data-color="fourColor" data-size="5.83_648_480">5.83寸 (四色, JD79665)</option>
+                    <option value="2a" data-color="blackWhiteColor" data-size="7.4_800_480">7.4寸 (黑白, 龙亭)</option>
+                    <option value="2b" data-color="threeColor" data-size="7.4_800_480">7.4寸 (三色, 龙亭)</option>
+                    <option value="06" data-color="blackWhiteColor" data-size="7.5_800_480">7.5寸 (黑白, UC8179)</option>
+                    <option value="07" data-color="threeColor" data-size="7.5_800_480">7.5寸 (三色, UC8179)</option>
+                    <option value="0c" data-color="fourColor" data-size="7.5_800_480">7.5寸 (四色, JD79665)</option>
+                    <option value="08" data-color="blackWhiteColor" data-size="7.5_640_384">7.5寸低分 (黑白, UC8159)</option>
+                    <option value="09" data-color="threeColor" data-size="7.5_640_384">7.5寸低分 (三色, UC8159)</option>
+                    <option value="0a" data-color="blackWhiteColor" data-size="7.5_880_528">7.5寸HD (黑白, SSD1677)</option>
+                    <option value="0b" data-color="threeColor" data-size="7.5_880_528">7.5寸HD (三色, SSD1677)</option>
+                    <option value="11" data-color="threeColor" data-size="10.2_960_640">10.2寸 (三色, SSD1677)</option>
+                    <option value="12" data-color="blackWhiteColor" data-size="10.2_960_640">10.2寸 (黑白, SSD1677)</option>
+                    <option value="10" data-color="fourColor" data-size="10.2_960_640">10.2寸 (四色, SSD2677)</option>
+                    <option value="15" data-color="sixColor" data-size="7.3E6_800_480">7.3寸 (六色, Spectra 6)</option>
+        `
+    }, 
+    // 👇 后续如需添加其他驱动预设，只需在此继续增加对象即可
+    {
+        id: "260OnlyOne",
+        name: "2.66寸52810专用",
+        optionsHtml: `
+                    <option value="01" data-color="threeColor" data-size="2.66_152_296" selected>2.66寸 (三色, SSD1680)</option>
+        `
+    }, 
+    {
+        id: "breeze4dev",
+        name: "breeze4dev驱动",
+        optionsHtml: `
+						<option value="01" data-color="blackWhiteColor" data-size="4.2_400_300">4.2寸 黑白 (UC8176)</option>
+						<option value="02" data-color="threeColor" data-size="4.2_400_300">4.2寸 BWR (SSD1619)</option>
+						<option value="03" data-color="threeColor" data-size="4.2_400_300">4.2寸 BWR (UC8176)</option>
+						<option value="06" data-color="threeColor" data-size="2.13_250_122">2.13寸 三色 (SSD16xx)</option>
+						<option value="08" data-color="threeColor" data-size="2.13_250_122" selected>2.13寸 三色 CE (SSD16xx)</option>
+						<option value="07" data-color="threeColor" data-size="2.9_296_128">2.9寸 三色 (SSD16xx)</option>
+						<option value="09" data-color="threeColor" data-size="2.9_296_128">2.9寸 三色 CE (SSD16xx)</option>
+						<option value="0a" data-color="blackWhiteColor" data-size="2.13_212_104">2.13寸 黑白 (SSD16xx)</option>
+						<option value="0b" data-color="blackWhiteColor" data-size="2.13_212_104">2.13寸 黑白 CE (SSD16xx)</option>
+        `
+    }
+];
+
+/**
+ * 根据预设ID更新 epddriver 的下拉选项
+ * @param {string} presetId 预设ID（对应 DRIVER_PRESETS 中的 id）
+ */
+function applyDriverPreset(presetId) {
+    const preset = DRIVER_PRESETS.find(p => p.id === presetId);
+    if (!preset) return;
+    const epddriver = document.getElementById("epddriver");
+    if (!epddriver) return;
+    // 使用 innerHTML 动态生成驱动选项（保留原有方式）
+    epddriver.innerHTML = preset.optionsHtml;
+    // 触发 updateDitcherOptions() 同步颜色模式、画布尺寸等
+    if (typeof updateDitcherOptions === 'function') {
+        updateDitcherOptions();
+    }
+    // 可选：手动派发 change 事件以保证外部监听
+    epddriver.dispatchEvent(new Event('change'));
+}
+
+// 初始化驱动预设下拉选择器
+function initDriverPresetSelector() {
+    const container = document.getElementById("driverPreset");
+    if (!container) return;
+    // 构建选项
+    DRIVER_PRESETS.forEach(preset => {
+        const option = document.createElement("option");
+        option.value = preset.id;
+        option.textContent = preset.name;
+        container.appendChild(option);
+    });
+    // 默认选中“东山驱动”
+    container.value = "dongshan";
+    // 监听变化
+    container.addEventListener("change", (e) => {
+        applyDriverPreset(e.target.value);
+    });
+    // 立即应用默认预设
+    applyDriverPreset("dongshan");
+}
+/*
+// 页面加载完成后初始化
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initDriverPresetSelector);
+} else {
+    initDriverPresetSelector();
+}
+*/
+
+
 // ==================== 主入口 ====================
 document.body.onload = () => {
     textDecoder = null;
@@ -1491,7 +2221,6 @@ document.body.onload = () => {
     updateButtonStatus();
     checkDebugMode();
 
-    // 延迟初始化编辑器，确保 DOM 完全加载
     const initEditors = () => {
         initImageEditor();
         initScheduleEditor();
@@ -1506,7 +2235,7 @@ document.body.onload = () => {
     }
 };
 
-// 事件初始化
+// 事件初始化（包含新增亮度滑块和同步时间按钮的监听）
 function initEventHandlers() {
     document.getElementById("ditherStrength").addEventListener("input", (e) => {
         document.getElementById("ditherStrengthValue").innerText = parseFloat(e.target.value).toFixed(1);
@@ -1516,6 +2245,16 @@ function initEventHandlers() {
         document.getElementById("ditherContrastValue").innerText = parseFloat(e.target.value).toFixed(1);
         applyDither();
     });
+    // 新增亮度滑块
+    const brightnessSlider = document.getElementById('ditherBrightness');
+    const brightnessValue = document.getElementById('ditherBrightnessValue');
+    if (brightnessSlider && brightnessValue) {
+        brightnessSlider.addEventListener('input', (e) => {
+            ditherBrightness = parseFloat(e.target.value);
+            brightnessValue.innerText = ditherBrightness.toFixed(1);
+            applyDither();
+        });
+    }
     const importBtn = document.getElementById("importholidaybutton");
     const holidayFile = document.getElementById("holidayJsonFile");
     if (importBtn && holidayFile) {
@@ -1528,6 +2267,58 @@ function initEventHandlers() {
             }
         });
     }
+    // 新增“同步时间”按钮监听
+    const syncTimeBtn = document.getElementById("syncTimeOnlyBtn");
+    if (syncTimeBtn) {
+        syncTimeBtn.addEventListener('click', () => syncTimeOnly());
+    }
+    //新增"下载图片"按钮监听
+    const downloadImgBtn = document.getElementById('download-image-btn');
+    if (downloadImgBtn) {
+        downloadImgBtn.addEventListener('click', downloadImage);
+    }
+    
+    // ---------- A/B面预览功能 ----------
+    const previewABtn = document.getElementById('previewA');
+    const previewBBtn = document.getElementById('previewB');
+    const syncBothBtn = document.getElementById('syncBothToCanvas');
+
+    if (previewABtn) {
+        previewABtn.addEventListener('click', async () => {
+            const file = document.getElementById('imageFileA')?.files[0];
+            if (!file) { addLog("请先选择A面图片"); return; }
+            await previewImageOnCanvas(file);
+        });
+    }
+    if (previewBBtn) {
+        previewBBtn.addEventListener('click', async () => {
+            const file = document.getElementById('imageFileB')?.files[0];
+            if (!file) { addLog("请先选择B面图片"); return; }
+            await previewImageOnCanvas(file);
+        });
+    }
+    if (syncBothBtn) {
+        syncBothBtn.addEventListener('click', async () => {
+            const fileA = document.getElementById('imageFileA')?.files[0];
+            const fileB = document.getElementById('imageFileB')?.files[0];
+            if (!fileA || !fileB) { addLog("请同时选择A面和B面图片"); return; }
+            await previewBothOnCanvas(fileA, fileB);
+        });
+    }
+    initDriverPresetSelector();//初始化驱动预设配置模块
+    document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) {
+            // 重新检查协议UI，强制重绘工具栏
+            updateUIBasedOnProtocol();
+            // 若当前有画板，重绘一次确保光标等正常
+            //if (paintManager) paintManager.redrawAll();
+        }
+    });
+    // 在 initEventHandlers 末尾添加
+    const syncABtn = document.getElementById('syncToABtn');
+    const syncBBtn = document.getElementById('syncToBBtn');
+    if (syncABtn) syncABtn.addEventListener('click', () => syncCurrentCanvasToSide('A'));
+    if (syncBBtn) syncBBtn.addEventListener('click', () => syncCurrentCanvasToSide('B'));
 }
 
 function checkDebugMode() {

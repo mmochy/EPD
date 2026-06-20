@@ -7,6 +7,16 @@
  */
 
 // ==================== 色板定义 ====================
+// 七色调色板 (Spectra 6 实际7色)
+const sevenColorPalette = [
+  { name: "黑色", r: 0, g: 0, b: 0, value: 0x00 },
+  { name: "白色", r: 255, g: 255, b: 255, value: 0x01 },
+  { name: "绿色", r: 41, g: 204, b: 20, value: 0x02 },
+  { name: "蓝色", r: 0, g: 0, b: 255, value: 0x03 },
+  { name: "红色", r: 255, g: 0, b: 0, value: 0x04 },
+  { name: "黄色", r: 255, g: 255, b: 0, value: 0x05 },
+  { name: "橙色", r: 255, g: 128, b: 0, value: 0x06 }
+];
 // 标准六色调色板（用于算法内部颜色匹配）
 // 固定的六色调色板
 const rgbPalette = [
@@ -35,6 +45,34 @@ const threeColorPalette = [
 
 // 墨水屏实际显示颜色（用于更精确的颜色匹配，解决偏红问题）
 const epdRealColors = {
+    /*
+    sevenColor: [//按国外资源做纠正的
+        { name: "黑色", realR: 25, realG: 30, realB: 33, r: 0, g: 0, b: 0, value: 0x00 },
+        { name: "白色", realR: 241, realG: 241, realB: 241, r: 255, g: 255, b: 255, value: 0x01 },
+        { name: "绿色", realR: 83, realG: 164, realB: 40, r: 0, g: 255, b: 0, value: 0x02 },
+        { name: "蓝色", realR: 49, realG: 49, realB: 143, r: 0, g: 0, b: 255, value: 0x03 },
+        { name: "红色", realR: 210, realG: 14, realB: 19, r: 255, g: 0, b: 0, value: 0x04 },
+        { name: "黄色", realR: 243, realG: 207, realB: 17, r: 255, g: 255, b: 0, value: 0x05 },
+        { name: "橙色", realR: 184, realG: 94, realB: 28, r: 255, g: 128, b: 0, value: 0x06 }
+    ], 
+    sevenColor: [//纯原始RGB色彩
+        { name: "黑色", realR: 0, realG: 0, realB: 0, r: 0, g: 0, b: 0, value: 0x00 },
+        { name: "白色", realR: 255, realG: 255, realB: 255, r: 255, g: 255, b: 255, value: 0x01 },
+        { name: "绿色", realR:0, realG: 255, realB: 0, r: 0, g: 255, b: 0, value: 0x02 },
+        { name: "蓝色", realR: 0, realG: 0, realB: 255, r: 0, g: 0, b: 255, value: 0x03 },
+        { name: "红色", realR: 255, realG: 0, realB: 0, r: 255, g: 0, b: 0, value: 0x04 },
+        { name: "黄色", realR: 255, realG: 255, realB: 0, r: 255, g: 255, b: 0, value: 0x05 },
+        { name: "橙色", realR: 255, realG: 128, realB: 0, r: 255, g: 128, b: 0, value: 0x06 }
+    ], */
+    sevenColor: [//按群内大佬调色做纠正的
+        { name: "黑色", realR: 0, realG: 0, realB: 0, r: 0, g: 0, b: 0, value: 0x00 },
+        { name: "白色", realR: 255, realG: 255, realB: 255, r: 255, g: 255, b: 255, value: 0x01 },
+        { name: "绿色", realR: 0, realG: 155, realB: 70, r: 0, g: 255, b: 0, value: 0x02 },
+        { name: "蓝色", realR: 0, realG: 65, realB: 175, r: 0, g: 0, b: 255, value: 0x03 },
+        { name: "红色", realR: 220, realG: 20, realB: 60, r: 255, g: 0, b: 0, value: 0x04 },
+        { name: "黄色", realR: 255, realG: 210, realB: 0, r: 255, g: 255, b: 0, value: 0x05 },
+        { name: "橙色", realR: 255, realG: 110, realB: 0, r: 255, g: 128, b: 0, value: 0x06 }
+    ],
     sixColor: [
         { name: "黄色", realR: 200, realG: 195, realB: 60, r: 255, g: 255, b: 0, value: 0xE2 },
         { name: "绿色", realR: 35, realG: 140, realB: 35, r: 41, g: 204, b: 20, value: 0x96 },
@@ -126,7 +164,8 @@ for (let i = 0; i < 4096; i++) {
     _linearToSrgb[i] = Math.min(255, Math.max(0, Math.round(255 * (v > 0.0031308 ? 1.055 * Math.pow(v, 1 / 2.4) - 0.055 : 12.92 * v))));
 }
 
-function findClosestColor(r, g, b, mode) {
+//以前的, 还能用
+function findClosestColorOld(r, g, b, mode) {
   let palette;
 
   if (mode === 'fourColor') {
@@ -167,6 +206,59 @@ function findClosestColor(r, g, b, mode) {
   }
 
   return closestColor;
+}
+//新改的, 看着准确度更高
+function findClosestColor(r, g, b, mode) {
+  if (mode === 'sevenColor') {
+    const targetLab = rgbToLabRed(r, g, b);
+    let best = epdSevenColorWithLab[0];
+    let bestDist = Infinity;
+    for (let i = 0; i < epdSevenColorWithLab.length; i++) {
+      const c = epdSevenColorWithLab[i];
+      const dist = ciede2000(targetLab, c.lab);
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = c;
+      }
+    }
+    return best;
+  } else if (mode === 'sixColor') {
+    const targetLab = rgbToLabRed(r, g, b);
+    let best = epdSixColorWithLab[0];
+    let bestDist = Infinity;
+    for (let i = 0; i < epdSixColorWithLab.length; i++) {
+      const c = epdSixColorWithLab[i];
+      const dist = ciede2000(targetLab, c.lab);
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = c;
+      }
+    }
+    return best;
+  } else if (mode === 'fourColor') {
+    const targetLab = rgbToLabRed(r, g, b);
+    let best = epdFourColorWithLab[0];
+    let bestDist = Infinity;
+    for (let i = 0; i < epdFourColorWithLab.length; i++) {
+      const c = epdFourColorWithLab[i];
+      const dist = ciede2000(targetLab, c.lab);
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = c;
+      }
+    }
+    return best;
+  } else if (mode === 'threeColor') {
+    // 优先红色检测
+    if (r > 120 && r > g * 1.5 && r > b * 1.5) {
+      return epdThreeColorWithLab.find(c => c.value === 0x02) || epdThreeColorWithLab[2];
+    }
+    const luminance = 0.299 * r + 0.587 * g + 0.114 * b;
+    return luminance < 128 ? epdThreeColorWithLab[0] : epdThreeColorWithLab[1];
+  } else { // blackWhite
+    const luminance = 0.299 * r + 0.587 * g + 0.114 * b;
+    return luminance < 140 ? { r:0,g:0,b:0,value:0 } : { r:255,g:255,b:255,value:1 };
+  }
 }
 
 /**
@@ -304,6 +396,7 @@ let epdFourColorWithLab = initPaletteLab(epdRealColors.fourColor, true);
 let epdThreeColorWithLab = initPaletteLab(epdRealColors.threeColor, true);
 let epdBWWithLab = initPaletteLab(epdRealColors.blackWhite, true);
 let epdSixColorWithLab = initPaletteLab(epdRealColors.sixColor, true);
+let epdSevenColorWithLab = initPaletteLab(epdRealColors.sevenColor, true);
 
 // 黑白阈值（基于 Lab 转换后的亮度）
 let _epdBWThreshold = (() => {
@@ -338,7 +431,8 @@ function _findClosestColorDirect(r, g, b, type) {
     }
 
     let palette;
-    if (type === "threeColor") palette = epdThreeColorWithLab;
+    if (type === "sevenColor") palette = epdSevenColorWithLab;
+    else if (type === "threeColor") palette = epdThreeColorWithLab;
     else if (type === "fourColor") palette = epdFourColorWithLab;
     else palette = epdSixColorWithLab;
 
@@ -1716,6 +1810,162 @@ function claheEnhance(imageData, clipLimit, tileSize) {
 }
 //重色模式使用函数结束
 
+
+// ==================== 对角线 Atkinson 抖动 (Diagonal Atkinson Dither) ====================
+/**
+ * 对角线偏置 Atkinson 误差扩散（sRGB空间 + 蛇形扫描）
+ *
+ * 设计依据（参考图片分析）：
+ *   img/1.jpg / img/3.jpg 特写可见明显人字形/斜纹纹理：
+ *     → 误差核偏向 ±45° 对角方向，形成级联的 V 形图案
+ *   img/2.jpg / img/3.jpg 暗部发丝有层次感（可见红/黑/黄混合点）：
+ *     → 说明暗区误差传播有效，必须在 sRGB 空间传播（不能用线性空间）
+ *
+ * 为什么不用线性空间误差传播：
+ *   暗区像素 linear≈0.03，量化到黑色后误差=0.03；
+ *   除以8后每邻居仅收到 0.003，远不足以翻转颜色，导致"发丝全黑"。
+ *   sRGB空间中同样像素值≈30，误差除以8≈3.7，可以正常积累触发翻转。
+ *
+ * 为什么不用亮度自适应 t 因子：
+ *   t 因子直接缩减误差传播量，暗区 t≈0.25 → 只传 25% 误差
+ *   → 积累更慢，发丝同样全黑。
+ *
+ * 核设计：
+ *   中间调（0.06 ≤ lum ≤ 0.94）— 对角偏置核（产生人字纹）：
+ *     (2s, 0)  × 1/8   水平跳格
+ *     (-s, +1) × 2/8   ↙ 强对角
+ *     (+s, +1) × 2/8   ↘ 强对角
+ *     (0,  +2) × 1/8   垂直跳格
+ *     总计 6/8（与标准 Atkinson 相同，保留 Atkinson 高光保护特性）
+ *
+ *   极值区（lum < 0.06 或 > 0.94）— 标准 Atkinson 核（保留层次感）：
+ *     (+s,0)  (+2s,0)  (-s,+1)  (0,+1)  (+s,+1)  (0,+2)  各 1/8
+ *     即时邻居（+s,0）权重确保每个误差立刻被吸收，防止大面积单色
+ *
+ * 蛇形扫描：奇数行从右向左，s=-1 自动翻转核的水平方向，
+ *   对角对称性保持不变（-s 和 +s 对角始终各占 2/8）。
+ *
+ * @param {ImageData} imageData  图像数据
+ * @param {number}    strength   抖动强度（0~1）
+ * @param {string}    colorMode  调色板模式
+ * @returns {ImageData}
+ */
+function diagonalDither(imageData, strength, colorMode) {
+    const width  = imageData.width;
+    const height = imageData.height;
+    const data   = imageData.data;
+    const N      = width * height;
+
+    // ── 预处理①：暗部提升（解决背景/发丝大面积纯黑问题）──────────────
+    // 对比 3.jpg vs 4.jpg：背景和发丝在3.jpg中为多色混合纹理，
+    // 4.jpg中则是大块纯黑，说明暗区像素（sRGB≈30-60）被全部量化到黑色。
+    // 根本原因：这些像素亮度 lum≈0.03-0.10，量化到黑色的误差太小，
+    //           无法通过 Atkinson 扩散触发邻居选非黑色。
+    // 方案：对 maxChannel < 115 的像素施加正比于暗度的亮度提升，
+    //       将其推入 lum≈0.15-0.25 的中间调区间，
+    //       让误差扩散有机会分配到红/黄色，产生多色纹理而非纯黑。
+    for (let i = 0; i < N; i++) {
+        const idx  = i * 4;
+        const r    = data[idx], g = data[idx + 1], b = data[idx + 2];
+        const maxC = r > g ? (r > b ? r : b) : (g > b ? g : b);
+        if (maxC < 115) {
+            // 最暗时提升约 +12，越接近 115 提升越少（线性渐变）
+            const lift = (((115 - maxC) / 115) * 12 + 0.5) | 0;
+            data[idx]     = r + lift;           // maxC < 115 → r+lift ≤ 137，无需 min
+            data[idx + 1] = g + lift;
+            data[idx + 2] = b + lift;
+        }
+    }
+
+    // ── 预处理②：暖色调向红色偏移（保守版）──────────────────────────
+    // 问题：CIEDE2000 在橙色调（R≈200,G≈150,B≈80）中把黄色 EPD 判定更近，
+    //       导致大量橙色像素被量化到黄色而非红色。
+    // 方案：对红色主导且饱和度足够的像素，小幅增大 R、减小 G。
+    //       比上一版保守（max 18→15），避免过度推移影响皮肤色调。
+    for (let i = 0; i < N; i++) {
+        const idx = i * 4;
+        const r = data[idx], g = data[idx + 1], b = data[idx + 2];
+        if (r > g && r > b && r > 80) {
+            const minC = g < b ? g : b;
+            const sat  = (r - minC) / r;
+            if (sat > 0.15) {
+                const boost = Math.min((sat * 22) | 0, 15);
+                data[idx]     = r + boost > 255 ? 255 : r + boost;
+                data[idx + 1] = g - (boost >> 1) < 0 ? 0 : g - (boost >> 1);
+            }
+        }
+    }
+
+    // 误差缓冲（sRGB 空间，单位与 data[] 相同：0-255 浮点）
+    const eR = new Float32Array(N);
+    const eG = new Float32Array(N);
+    const eB = new Float32Array(N);
+
+    const useLegacy = document.getElementById('useLegacyDither').checked;
+
+    // 安全加误差辅助（边界检查）
+    const addErr = (arr, nx, ny, v) => {
+        if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+            arr[ny * width + nx] += v;
+        }
+    };
+
+    // ── 对角线扫描 + 标准 Atkinson 核 ──────────────────────────────────
+    // 核心思路：扫描顺序决定纹理方向。
+    // 横向扫描 → 误差横向流动 → 横向纹理（无论核如何调整都无法根本改变）
+    // 对角扫描 → 误差沿斜线流动 → 自然产生 45° 斜向纹理
+    //
+    // 按斜线 d = x+y 的顺序处理像素（d=0,1,2,...,W+H-2）
+    // 每条斜线内从右上到左下：(xStart,yStart) → (xStart-1,yStart+1) → ...
+    // 斜线"前进"方向 = (-1,+1)，Atkinson 的 6 个邻居全部在未处理区域：
+    //   斜线内前进：(x-1,y+1) [d]   (x-2,y+2) [d]
+    //   下一条斜线：(x+1,y)   [d+1] (x,y+1)   [d+1] (x-1,y+2) [d+1]
+    //   跨两条斜线：(x,y+2)   [d+2]
+    // 总计 6/8（标准 Atkinson），无需修改核，扫描方向本身产生斜纹
+
+    for (let d = 0; d < width + height - 1; d++) {
+        const xStart = Math.min(d, width  - 1);
+        const yStart = Math.max(0, d - width + 1);
+        const xEnd   = Math.max(0, d - height + 1);
+        const len    = xStart - xEnd + 1;
+
+        for (let k = 0; k < len; k++) {
+            const x  = xStart - k;
+            const y  = yStart + k;
+            const pi = y * width + x;
+            const idx = pi * 4;
+
+            const r = Math.max(0, Math.min(255, data[idx]     + eR[pi]));
+            const g = Math.max(0, Math.min(255, data[idx + 1] + eG[pi]));
+            const b = Math.max(0, Math.min(255, data[idx + 2] + eB[pi]));
+
+            const closest = useLegacy
+                ? findClosestColorRed(r|0, g|0, b|0, colorMode)
+                : findClosestColor(r|0, g|0, b|0, colorMode);
+
+            data[idx]     = closest.r;
+            data[idx + 1] = closest.g;
+            data[idx + 2] = closest.b;
+
+            const dR = (r - closest.r) * strength;
+            const dG = (g - closest.g) * strength;
+            const dB = (b - closest.b) * strength;
+
+            // 标准 Atkinson 核，沿对角扫描方向自动产生斜向纹理
+            // 权重验证：6 × 1/8 = 6/8 ✓
+            addErr(eR, x-1, y+1, dR/8); addErr(eG, x-1, y+1, dG/8); addErr(eB, x-1, y+1, dB/8); // 斜线前进
+            addErr(eR, x-2, y+2, dR/8); addErr(eG, x-2, y+2, dG/8); addErr(eB, x-2, y+2, dB/8); // 斜线跳格
+            addErr(eR, x+1, y,   dR/8); addErr(eG, x+1, y,   dG/8); addErr(eB, x+1, y,   dB/8); // d+1 右侧
+            addErr(eR, x,   y+1, dR/8); addErr(eG, x,   y+1, dG/8); addErr(eB, x,   y+1, dB/8); // d+1 下方
+            addErr(eR, x-1, y+2, dR/8); addErr(eG, x-1, y+2, dG/8); addErr(eB, x-1, y+2, dB/8); // d+1 斜下
+            addErr(eR, x,   y+2, dR/8); addErr(eG, x,   y+2, dG/8); addErr(eB, x,   y+2, dB/8); // d+2 跳格
+        }
+    }
+    return imageData;
+}
+
+
+
 // ==================== 主抖动分发函数 ====================
 function ditherImage(imageData, alg, strength, colorMode) {
   
@@ -1749,16 +1999,113 @@ function ditherImage(imageData, alg, strength, colorMode) {
         case "twoRowSierra": return twoRowSierraDither(imageData, strength, colorMode);
         case "ostromoukhov": return ostromoukhovDither(imageData, strength, colorMode);
         case "linearLightSierra": return linearLightSierraDither(imageData, strength, colorMode);
+        case "diagonal": return diagonalDither(imageData, strength, colorMode);
         default: return imageData;
     }
 }
 
 
+/**
+ * 从经过抖动处理后的 ImageData 中提取每个像素的六色索引
+ * @param {ImageData} imageData 抖动后的图像数据（每个像素 RGB 已量化到六色）
+ * @param {Array} palette 六色调色板对象数组（带 value 字段）
+ * @returns {Uint8Array} 每个像素一个字节的索引数组（0-5）
+ */
+function extractSixColorIndex(imageData, palette) {
+    const data = imageData.data;
+    const total = imageData.width * imageData.height;
+    const indexArray = new Uint8Array(total);
+    // 构建快速查找表：RGB -> 索引
+    const lookup = new Map();
+    for (let i = 0; i < palette.length; i++) {
+        const c = palette[i];
+        const key = `${c.r},${c.g},${c.b}`;
+        lookup.set(key, i);
+    }
+    for (let i = 0; i < total; i++) {
+        const r = data[i*4];
+        const g = data[i*4+1];
+        const b = data[i*4+2];
+        const key = `${r},${g},${b}`;
+        let idx = lookup.get(key);
+        if (idx === undefined) {
+            // 回退：查找最接近的颜色（理论上抖动后应该精确匹配）
+            let best = 0, bestDist = Infinity;
+            for (let j = 0; j < palette.length; j++) {
+                const c = palette[j];
+                const dr = r - c.r, dg = g - c.g, db = b - c.b;
+                const dist = dr*dr + dg*dg + db*db;
+                if (dist < bestDist) {
+                    bestDist = dist;
+                    best = j;
+                }
+            }
+            idx = best;
+        }
+        indexArray[i] = idx;
+    }
+    return indexArray;
+}
+/**
+ * 将六色索引数组打包为 E6 所需的 4bit 格式（每字节两个像素）
+ * @param {Uint8Array} indexArray 每个像素一个字节，值 0-5
+ * @param {number} width
+ * @param {number} height
+ * @returns {Uint8Array} 打包后的数据，长度为 ceil(width*height/2)
+ */
+function packSixColorTo4bit(indexArray, width, height) {
+    const total = width * height;
+    const packed = new Uint8Array(Math.ceil(total / 2));
+    for (let i = 0; i < total; i += 2) {
+        const high = indexArray[i] & 0x0F;
+        const low = (i+1 < total) ? (indexArray[i+1] & 0x0F) : 0;
+        packed[i >> 1] = (high << 4) | low;
+    }
+    return packed;
+}
+/**
+ * 将六色索引数组映射为波形码（2bpp），每两个像素合并为一个字节
+ * @param {Uint8Array} indexArray 原始索引 0-5
+ * @param {number} width
+ * @param {number} height
+ * @param {boolean} firstStage true 使用 color_map，false 使用 color_map1
+ * @returns {Uint8Array} 波形数据，每字节包含4个像素（每个像素2位）
+ */
+function mapSixColorToWaveform(indexArray, width, height, firstStage) {
+    const map = firstStage ? [1,1,2,3,0,1] : [0,1,1,3,1,2];
+    const total = width * height;
+    const out = new Uint8Array(Math.ceil(total / 4)); // 每4个像素输出1字节
+    for (let i = 0; i < total; i += 4) {
+        let byte = 0;
+        for (let j = 0; j < 4; j++) {
+            if (i + j < total) {
+                const idx = indexArray[i + j];
+                const val = map[idx];
+                byte |= (val << (6 - j*2));
+            }
+        }
+        out[i >> 2] = byte;
+    }
+    return out;
+}
+
 function decodeProcessedData(processedData, width, height, mode) {
   const imageData = new ImageData(width, height);
   const data = imageData.data;
 
-  if (mode === 'sixColor') {
+  if (mode === 'sevenColor') {
+        for (let y = 0; y < height; y++) {
+            for (let x = 0; x < width; x++) {
+                const val = processedData[y * width + x];
+                const color = epdSevenColorWithLab.find(c => c.value === val) || epdSevenColorWithLab[1];
+                const idx = (y * width + x) * 4;
+                data[idx] = color.r;
+                data[idx+1] = color.g;
+                data[idx+2] = color.b;
+                data[idx+3] = 255;
+            }
+        }
+    } else if (mode === 'sixColor') {
     for (let y = 0; y < height; y++) {
       for (let x = 0; x < width; x++) {
         const newIndex = (x * height) + (height - 1 - y);
@@ -1842,7 +2189,18 @@ function processImageData(imageData, mode) {
 
   let processedData;
 
-  if (mode === 'sixColor') {
+  if (mode === 'sevenColor') {
+        const result = new Uint8Array(width * height);
+        for (let y = 0; y < height; y++) {
+            for (let x = 0; x < width; x++) {
+                const idx = (y * width + x) * 4;
+                const r = data[idx], g = data[idx+1], b = data[idx+2];
+                const closest = findClosestColor(r, g, b, 'sevenColor');
+                result[y * width + x] = closest.value;
+            }
+        }
+        return result;
+    } else if (mode === 'sixColor') {
     processedData = new Uint8Array(width * height);
     for (let y = 0; y < height; y++) {
       for (let x = 0; x < width; x++) {
