@@ -121,13 +121,15 @@ function resetVariables() {
     txCharacteristic = null;
     cmdCharacteristic = null;
     msgIndex = 0;
+    deviceConfig = null;
     const logEl = document.getElementById("log");
     if (logEl) logEl.innerHTML = '';
 }
 
 // ==================== 蓝牙写入（带防冲突锁）====================
 let writeInProgress = false;
-const WRITE_DELAY_MS = 50;
+let deviceConfig = null;
+const CONTROL_WRITE_DELAY_MS = 20;
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
 async function write(cmd, data, withResponse = true) {
@@ -138,14 +140,15 @@ async function write(cmd, data, withResponse = true) {
     }
     writeInProgress = true;
     try {
-        const payload = [cmd];
+        let body = new Uint8Array(0);
         if (data) {
             if (typeof data === 'string') data = hex2bytes(data);
-            if (data instanceof Uint8Array) data = Array.from(data);
-            payload.push(...data);
+            body = data instanceof Uint8Array ? data : Uint8Array.from(data);
         }
-        addLog(bytes2hex(payload), '⇑');
-        const dataBuffer = Uint8Array.from(payload);
+        const dataBuffer = new Uint8Array(body.length + 1);
+        dataBuffer[0] = cmd;
+        dataBuffer.set(body, 1);
+        if (cmd !== EpdCmd.WRITE_IMG || withResponse) addLog(bytes2hex(dataBuffer), '⇑');
         
         // ==============================================
         // 🔥 核心兼容写法：自动适配所有浏览器/设备
@@ -165,7 +168,7 @@ async function write(cmd, data, withResponse = true) {
                 await epdCharacteristic.writeValue(dataBuffer);
             }
         }
-        await sleep(WRITE_DELAY_MS);
+        if (withResponse && CONTROL_WRITE_DELAY_MS > 0) await sleep(CONTROL_WRITE_DELAY_MS);
         return true;
     } catch (e) {
         console.error(e);
@@ -178,18 +181,24 @@ async function write(cmd, data, withResponse = true) {
 
 // ==================== 图像传输（支持CRC模式）====================
 async function writeImage(data, step = 'bw') {
-    const mtu = parseInt(document.getElementById('mtusize').value) - 2;
-    const interleavedCount = parseInt(document.getElementById('interleavedcount').value);
-    const count = Math.round(data.length / mtu);
+    const configuredMtu = parseInt(document.getElementById('mtusize').value, 10);
+    const configuredInterval = parseInt(document.getElementById('interleavedcount').value, 10);
+    const mtu = Math.max(1, (Number.isFinite(configuredMtu) ? configuredMtu : 20) - 2);
+    const interleavedCount = Number.isFinite(configuredInterval) && configuredInterval >= 0
+        ? configuredInterval
+        : 20;
+    const count = Math.ceil(data.length / mtu);
     let chunkIdx = 0;
     let noReplyCount = interleavedCount;
     for (let i = 0; i < data.length; i += mtu) {
-        const currentTime = (Date.now() - startTime) / 1000.0;
-        setStatus(`${step === 'bw' ? '黑白' : '颜色'}块: ${chunkIdx + 1}/${count + 1}, 总用时: ${currentTime}s`);
-        const payload = [
-            (step === 'bw' ? 0x0F : 0x00) | (i === 0 ? 0x00 : 0xF0),
-            ...data.slice(i, i + mtu)
-        ];
+        if (chunkIdx % 10 === 0 || chunkIdx + 1 === count) {
+            const currentTime = (Date.now() - startTime) / 1000.0;
+            setStatus(`${step === 'bw' ? '黑白' : '颜色'}块: ${chunkIdx + 1}/${count}, 总用时: ${currentTime}s`);
+        }
+        const chunk = data.subarray(i, Math.min(i + mtu, data.length));
+        const payload = new Uint8Array(chunk.length + 1);
+        payload[0] = (step === 'bw' ? 0x0F : 0x00) | (i === 0 ? 0x00 : 0xF0);
+        payload.set(chunk, 1);
         if (noReplyCount > 0) {
             await write(EpdCmd.WRITE_IMG, payload, false);
             noReplyCount--;
@@ -208,7 +217,7 @@ async function writeImageCRC(data, step = 'bw') {
         const epdDriverSelect = document.getElementById('epddriver');
         const epdDriverPreset = document.getElementById('driverPreset');
         addLog(`驱动预设: ${epdDriverPreset.value}  驱动ID:${epdDriverSelect.value}`);
-        if(epdDriverPreset.value == "tsl0922" && epdDriverSelect.value == "13") data = JD79660JiaoCuoYuChuLi(data);
+        if(epdDriverPreset.value == "tsl0922" && epdDriverSelect.value == "14") data = JD79660JiaoCuoYuChuLi(data);
         await BleTransfer.sendImageWithResume(data, step, (sent, total, speedInfo) => {
             if (speedInfo) {
                 setStatus(`${stepName}块(CRC): ${sent}/${total}, ${BleTransfer.getSpeedString()}, ${speedInfo.elapsed}s`);
@@ -228,8 +237,21 @@ async function writeImageCRC(data, step = 'bw') {
 // ==================== 设备控制 ====================
 async function setDriver() {
     if (!confirm('确认设置驱动配置？此操作将重新初始化屏幕。')) return;
-    await write(EpdCmd.SET_PINS, document.getElementById("epdpins").value);
-    await write(EpdCmd.INIT, document.getElementById("epddriver").value);
+    const pins = hex2bytes(document.getElementById("epdpins").value);
+    const modelId = parseInt(document.getElementById("epddriver").value, 16);
+    if (deviceConfig && deviceConfig.length >= 13 && pins.length >= 7) {
+        const config = new Uint8Array(deviceConfig);
+        config.set(pins.slice(0, 7), 0);
+        config[7] = modelId;
+        if (pins.length > 7) config[10] = pins[7];
+        if (!await write(EpdCmd.SET_CONFIG, config)) return;
+        deviceConfig = config;
+        await sleep(1000);
+        await write(EpdCmd.INIT);
+    } else {
+        if (!await write(EpdCmd.SET_PINS, pins)) return;
+        if (!await write(EpdCmd.INIT, [modelId])) return;
+    }
     addLog("驱动配置已设置");
 }
 
@@ -274,19 +296,6 @@ async function syncTime(mode) {
     if (mode === 1) {
         await syncHolidayData();
         await sleep(200);
-    }
-    const timestamp = Math.floor(Date.now() / 1000);
-    const data = new Uint8Array([
-        (timestamp >> 24) & 0xFF,
-        (timestamp >> 16) & 0xFF,
-        (timestamp >> 8) & 0xFF,
-        timestamp & 0xFF,
-        -(new Date().getTimezoneOffset() / 60),
-        mode
-    ]);
-    if (await write(EpdCmd.SET_TIME, data)) {
-        addLog("时间已同步！");
-        addLog("屏幕刷新完成前请不要操作。");
     }
     await sendTimeCommand(mode, mode === 1 ? '日历模式' : '时钟模式');
 }
@@ -1158,6 +1167,7 @@ function handleNotify(value, idx) {
     // idx === 0: 设备主动上报配置（仅 Web 协议）
     if (idx === 0) {
         addLog(`收到配置：${bytes2hex(data)}`);
+        deviceConfig = new Uint8Array(data);
         const epdpins = document.getElementById("epdpins");
         const epddriver = document.getElementById("epddriver");
         epdpins.value = bytes2hex(data.slice(0, 7));
@@ -2108,8 +2118,8 @@ const DRIVER_PRESETS = [
         name: "TSL0922驱动",
         // 选项HTML（与原 QuDong_Tsl0922 完全一致）
         optionsHtml: `
-                    <option value="13" data-color="fourColor" data-size="3.98_768_552">3.98寸A0 (四色, JD79665)</option>
-                    <option value="14" data-color="fourColor" data-size="3.98_768_552">3.98寸A1 (四色, JD79665)</option>
+                    <option value="14" data-color="fourColor" data-size="3.98_768_552">3.98寸A0 (四色, JD79660)</option>
+                    <option value="15" data-color="fourColor" data-size="3.98_768_552">3.98寸A1 (四色, JD79661)</option>
                     <option value="01" data-color="blackWhiteColor" data-size="4.2_400_300">4.2寸 (黑白, UC8176)</option>
                     <option value="03" data-color="threeColor" data-size="4.2_400_300"  selected>4.2寸 (三色, UC8176)</option>
                     <option value="04" data-color="blackWhiteColor" data-size="4.2_400_300">4.2寸 (黑白, SSD1619)</option>
@@ -2164,12 +2174,22 @@ const DRIVER_PRESETS = [
     }
 ];
 
+const ACTIVE_DRIVER_PRESETS = [{
+    id: "dongshan",
+    name: "东山 A0/A1",
+    optionsHtml: `
+        <option value="14" data-color="fourColor" data-size="3.98_768_552" selected>3.98寸 (四色, 华为手机壳A0)</option>
+        <option value="15" data-color="fourColor" data-size="3.98_768_552">3.98寸 (四色, 华为手机壳A1)</option>
+        <option value="23" data-color="fourColor" data-size="3.98_768_552">3.98寸 (四色, 华为手机壳A1.1)</option>
+    `
+}];
+
 /**
  * 根据预设ID更新 epddriver 的下拉选项
  * @param {string} presetId 预设ID（对应 DRIVER_PRESETS 中的 id）
  */
 function applyDriverPreset(presetId) {
-    const preset = DRIVER_PRESETS.find(p => p.id === presetId);
+    const preset = ACTIVE_DRIVER_PRESETS.find(p => p.id === presetId);
     if (!preset) return;
     const epddriver = document.getElementById("epddriver");
     if (!epddriver) return;
@@ -2188,7 +2208,7 @@ function initDriverPresetSelector() {
     const container = document.getElementById("driverPreset");
     if (!container) return;
     // 构建选项
-    DRIVER_PRESETS.forEach(preset => {
+    ACTIVE_DRIVER_PRESETS.forEach(preset => {
         const option = document.createElement("option");
         option.value = preset.id;
         option.textContent = preset.name;
