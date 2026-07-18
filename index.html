@@ -95,6 +95,14 @@
                 <button id="clockmodebutton" type="button" class="primary" onclick="syncTime(2)">时钟模式</button>
                 <button id="clearscreenbutton" type="button" class="secondary" onclick="clearScreen()">清除屏幕</button>
             </div>
+            <div class="flex-group">
+                <label for="ledMode">指示灯</label>
+                <select id="ledMode">
+                    <option value="0">关闭</option>
+                    <option value="1" selected>打开</option>
+                </select>
+                <button id="setLedModeButton" type="button" class="secondary" onclick="setLedMode()">应用</button>
+            </div>
             <div class="flex-group right debug">
                 <input type="text" id="cmdTXT" value="">
                 <button id="sendcmdbutton" type="button" class="primary" onclick="sendcmd()">发送命令</button>
@@ -174,8 +182,10 @@
                     <option value="3.5_384_184">3.5 (384x184)</option>
                     <option value="3.7_240_416">3.7 (240x416)</option>
                     <option value="3.7_416_240">3.7 (416x240)</option>
-                    <option value="3.97_800_480">3.97 (800x480)</option>
+                    <option value="3.68_E6_792_528">3.68 E6 (792x528)</option>
+                    <option value="3.87_800_480">3.87 (800x480)</option>
                     <option value="3.98_768_552">3.98 (768x552)</option>
+                    <option value="3.98_E6_768_552">3.98 E6 (768x552)</option>
                     <option value="4.2_400_300" selected>4.2 (400x300)</option>
                     <option value="5.79_792_272">5.79 (792x272)</option>
                     <option value="5.81_720_256">5.81 (720x256)</option>
@@ -505,7 +515,7 @@
 <script type="text/javascript" src="js/lz77.js?v=20260202"></script>
 <script type="text/javascript" src="js/epd_format.js?v=20251109"></script>
 <script type="text/javascript" src="js/app_protocol.js?v=20260131_2"></script>
-<script type="text/javascript" src="js/main.js?v=20260131_4"></script>
+<script type="text/javascript" src="js/main.js?v=20260718_387_driver"></script>
 <script type="text/javascript">
 function checkDebugModeDo(value) {
     const link = document.getElementById('debug-toggle');

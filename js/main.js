@@ -11,9 +11,24 @@
 // ==================== 全局变量 ====================
 let bleDevice, gattServer;
 let epdService, epdCharacteristic, txCharacteristic, cmdCharacteristic;
+let e6ReadyResolver = null;
 let startTime, msgIndex, appVersion;
 let canvas, ctx, textDecoder;
 let paintManager, cropManager;
+
+function waitForE6Ready(timeoutMs = 30000) {
+    return new Promise(resolve => {
+        const timer = setTimeout(() => {
+            e6ReadyResolver = null;
+            resolve(false);
+        }, timeoutMs);
+        e6ReadyResolver = () => {
+            clearTimeout(timer);
+            e6ReadyResolver = null;
+            resolve(true);
+        };
+    });
+}
 
 // APP版本号
 const APP_VERSION = '2.1.0';
@@ -39,6 +54,8 @@ const EpdCmd = {
     SET_CONFIG: 0x90,
     SYS_RESET: 0x91,
     SYS_SLEEP: 0x92,
+    DISCONNECT: 0x93,
+    SET_LED_MODE: 0x94,
     CFG_ERASE: 0x99,
     SET_HOLIDAYS: 0xB6,        // 设置假期数据
     GHOSTING_CLEAR: 0xB7,      // 开始残影消除
@@ -64,8 +81,10 @@ const canvasSizes = [
     { name: '3.5_384_184', width: 384, height: 184 },
     { name: '3.7_240_416', width: 240, height: 416 },//3.7寸 第一代AI智屏壳
     { name: '3.7_416_240', width: 416, height: 240 },
-    { name: '3.97_800_480', width: 800, height: 480 },
+    { name: '3.68_E6_792_528', width: 792, height: 528 },
+    { name: '3.87_800_480', width: 800, height: 480 },
     { name: '3.98_768_552', width: 768, height: 552 },//3.98寸四色手机壳
+    { name: '3.98_E6_768_552', width: 768, height: 552 },
     { name: '4.2_400_300', width: 400, height: 300 },
     { name: '5.79_792_272', width: 792, height: 272 },
     { name: '5.81_720_256', width: 720, height: 256 },//海带屏
@@ -184,9 +203,14 @@ async function writeImage(data, step = 'bw') {
     const configuredMtu = parseInt(document.getElementById('mtusize').value, 10);
     const configuredInterval = parseInt(document.getElementById('interleavedcount').value, 10);
     const mtu = Math.max(1, (Number.isFinite(configuredMtu) ? configuredMtu : 20) - 2);
-    const interleavedCount = Number.isFinite(configuredInterval) && configuredInterval >= 0
-        ? configuredInterval
-        : 20;
+    const selectedDriver = document.getElementById('epddriver')?.value?.toUpperCase();
+    // JD79667 toggles CS for every display byte and consumes BLE packets more slowly.
+    // A response for every packet provides transport-level flow control and prevents queue overflow.
+    const interleavedCount = selectedDriver === '25'
+        ? 0
+        : Number.isFinite(configuredInterval) && configuredInterval >= 0
+            ? configuredInterval
+            : 20;
     const count = Math.ceil(data.length / mtu);
     let chunkIdx = 0;
     let noReplyCount = interleavedCount;
@@ -197,7 +221,8 @@ async function writeImage(data, step = 'bw') {
         }
         const chunk = data.subarray(i, Math.min(i + mtu, data.length));
         const payload = new Uint8Array(chunk.length + 1);
-        payload[0] = (step === 'bw' ? 0x0F : 0x00) | (i === 0 ? 0x00 : 0xF0);
+        const channel = step === 'bw' ? 0x0F : step === 'e6Second' ? 0x01 : 0x00;
+        payload[0] = channel | (i === 0 ? 0x00 : 0xF0);
         payload.set(chunk, 1);
         if (noReplyCount > 0) {
             await write(EpdCmd.WRITE_IMG, payload, false);
@@ -217,7 +242,6 @@ async function writeImageCRC(data, step = 'bw') {
         const epdDriverSelect = document.getElementById('epddriver');
         const epdDriverPreset = document.getElementById('driverPreset');
         addLog(`驱动预设: ${epdDriverPreset.value}  驱动ID:${epdDriverSelect.value}`);
-        if(epdDriverPreset.value == "tsl0922" && epdDriverSelect.value == "14") data = JD79660JiaoCuoYuChuLi(data);
         await BleTransfer.sendImageWithResume(data, step, (sent, total, speedInfo) => {
             if (speedInfo) {
                 setStatus(`${stepName}块(CRC): ${sent}/${total}, ${BleTransfer.getSpeedString()}, ${speedInfo.elapsed}s`);
@@ -253,6 +277,14 @@ async function setDriver() {
         if (!await write(EpdCmd.INIT, [modelId])) return;
     }
     addLog("驱动配置已设置");
+}
+
+async function setLedMode() {
+    const select = document.getElementById('ledMode');
+    const enabled = select.value === '1';
+    if (!await write(EpdCmd.SET_LED_MODE, [enabled ? 1 : 0])) return;
+    if (deviceConfig && deviceConfig.length > 9) deviceConfig[9] = enabled ? 0x12 : 0xFE;
+    addLog(enabled ? '三个指示灯已打开' : '三个指示灯已关闭');
 }
 
 function getWeekStart() {
@@ -535,50 +567,6 @@ async function sendimgAppMode() {
     }
 }
 
-//交错处理抖动好的数据
-/**
- * JD79660 屏幕数据交错重排函数
- * 适配tsl0922驱动 3.98寸 768x552屏幕
- * 逻辑行552行(0~551)，上下各276行交错映射物理行
- * @param {Uint8Array} rawData 原始未重排四色图像数据，每字节4像素
- * @returns {Uint8Array} 交错重排完成后的图像数据
- */
-function JD79660JiaoCuoYuChuLi(rawData) {
-    // 1. 获取当前画布尺寸 匹配 canvasSizes 中 3.98_768_552
-    const sizeItem = canvasSizes.find(item => item.name === "3.98_768_552");
-    const W = sizeItem.width;  // 768
-    const H = sizeItem.height; // 552
-    const lineByteCount = W / 4; // 单行字节数 768/4=192
-    const halfLineCount = H / 2;   // 上下两半各276行
-
-    // 分配输出缓冲区，总长度和原始数据一致 W*H/4
-    const interleaveBuf = new Uint8Array(rawData.length);
-    addLog("TSL0922大佬的A0交错预处理!接收端不处理.");
-
-    // 遍历每一行逻辑行 (0 ~ 551)
-    for (let logicRow = 0; logicRow < H; logicRow++) {
-        // 计算当前逻辑行在原始数组的起始偏移
-        const rawLineOffset = logicRow * lineByteCount;
-        // 计算映射后的物理行
-        let physicalRow;
-        if (logicRow < halfLineCount) {
-            // 上半部分0~275 → 偶数物理行 0,2,4...550
-            physicalRow = logicRow * 2;
-        } else {
-            // 下半部分276~551 → 反向奇数行 551,549...1
-            const offset = logicRow - halfLineCount;
-            physicalRow = (H - 1) - 2 * offset;
-        }
-        // 物理行对应输出缓冲区偏移
-        const targetOffset = physicalRow * lineByteCount;
-        // 复制单行全部字节到交错缓冲区对应位置
-        for (let b = 0; b < lineByteCount; b++) {
-            interleaveBuf[targetOffset + b] = rawLineOffset + b < rawData.length ? rawData[rawLineOffset + b] : 0;
-        }
-    }
-    return interleaveBuf;
-}
-
 // ==================== 发送图片（支持双协议）====================
 async function sendimg() {
     if (cropManager.isCropMode()) {
@@ -619,7 +607,7 @@ async function sendimg() {
     statusEl.parentElement.style.display = "block";
 
     const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    const processedData = processImageData(imageData, ditherMode);
+    const processedData = ditherMode === 'sixColor' ? null : processImageData(imageData, ditherMode);
 
     updateButtonStatus(true);
     await write(EpdCmd.INIT);
@@ -629,34 +617,19 @@ async function sendimg() {
     if (useCRC) addLog("使用CRC校验传输模式");
 
     if (ditherMode === 'sixColor') {
-        // 1. 获取画布原始六色索引 0黄,1绿,2蓝,3红,4黑,5白
-        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        const sixColorPalette = epdRealColors.sixColor;
-        const indexArray = extractSixColorIndex(imageData);
-        
-        // 上位下标转硬件4bit码：0→2,1→6,2→5,3→3,4→0,5→1
-        const hwMap = [2, 6, 5, 3, 0, 1];
-        const mappedArray = new Uint8Array(indexArray.length);
-        for (let i = 0; i < indexArray.length; i++) {
-            mappedArray[i] = hwMap[indexArray[i]];
-        }
-        // 打包4bit原始数据（传给固件第一层输入）
-        const rawData = packSixColorTo4bit(mappedArray, canvas.width, canvas.height);
-        
-        startTime = Date.now();
-        const statusEl = document.getElementById("status");
-        statusEl.parentElement.style.display = "block";
-        updateButtonStatus(true);
-        await write(EpdCmd.INIT);
-    
-        // ========== 第一阶段刷新 color_map ==========
-        await transferFn(rawData, 'color');
+        const indexArray = extractSixColorIndex(imageData, epdRealColors.sixColor);
+        const firstPass = mapSixColorToWaveform(indexArray, canvas.width, canvas.height, true);
+        const secondPass = mapSixColorToWaveform(indexArray, canvas.width, canvas.height, false);
+
+        addLog(`E6 第一阶段: ${firstPass.length} 字节`);
+        await writeImage(firstPass, 'e6First');
+        const firstRefreshReady = waitForE6Ready();
         await write(EpdCmd.REFRESH);
-        addLog("⏳ E6 第一阶段刷新( color_map )等待10秒...");
-        await sleep(10000);
-    
-        // ========== 第二阶段刷新 color_map1 ==========
-        await transferFn(rawData, 'color');
+        addLog("E6 第一阶段刷新，等待屏幕就绪...");
+        if (!await firstRefreshReady) throw new Error("E6 第一阶段刷新超时");
+
+        addLog(`E6 第二阶段: ${secondPass.length} 字节`);
+        await writeImage(secondPass, 'e6Second');
         await write(EpdCmd.REFRESH);
     
         updateButtonStatus();
@@ -976,8 +949,13 @@ async function filterConnect() {
 
 async function preConnect(useFilter = false, forceNew = false) {
     if (gattServer && gattServer.connected) {
-    	if (bleDevice && bleDevice.gatt.connected) bleDevice.gatt.disconnect();
-    	if (!forceNew) return; await sleep(300);
+        const connectedDevice = bleDevice;
+        document.getElementById("connectbutton").innerHTML = '正在断开...';
+        if (epdCharacteristic) await write(EpdCmd.DISCONNECT, null, false);
+        await sleep(150);
+        if (connectedDevice && connectedDevice.gatt.connected) connectedDevice.gatt.disconnect();
+        if (!forceNew) return;
+        await sleep(300);
     }
     resetVariables();
     try {
@@ -1173,13 +1151,16 @@ function handleNotify(value, idx) {
         epdpins.value = bytes2hex(data.slice(0, 7));
         if (data.length > 10) epdpins.value += bytes2hex(data.slice(10, 11));
         epddriver.value = bytes2hex(data.slice(7, 8));
+        if (data.length > 9) document.getElementById('ledMode').value = data[9] === 0xFE ? '0' : '1';
         updateDitcherOptions();
     } else {
         // 普通文本消息
         if (!textDecoder) textDecoder = new TextDecoder();
         const msg = textDecoder.decode(data);
         addLog(msg, '⇓');
-        if (msg.startsWith('mtu=') && msg.length > 4) {
+        if (msg === 'e6_ready') {
+            if (e6ReadyResolver) e6ReadyResolver();
+        } else if (msg.startsWith('mtu=') && msg.length > 4) {
             const mtu = parseInt(msg.substring(4));
             document.getElementById('mtusize').value = mtu;
             addLog(`MTU 已更新为: ${mtu}`);
@@ -2089,10 +2070,11 @@ const DRIVER_PRESETS = [
                     <option value="20" data-color="blackWhiteColor" data-size="2.9_128_296">2.9寸 (黑白, UC8151D)</option>
                     <option value="10" data-color="fourColor" data-size="3.1_300_300">3.1寸 (四色, JD79665)</option>
                     <option value="18" data-color="threeColor" data-size="3.7_416_240">3.7寸 (三色, AI智屏壳)</option>
-                    <option value="1c" data-color="fourColor" data-size="3.97_800_480">3.97寸 (四色, 方角四色屏)</option>
+                    <option value="1c" data-color="fourColor" data-size="3.87_800_480">3.87寸 (四色, KEGM038701E01-J665)</option>
                     <option value="14" data-color="fourColor" data-size="3.98_768_552">3.98寸 (四色, 华为手机壳A0)</option>
                     <option value="15" data-color="fourColor" data-size="3.98_768_552">3.98寸 (四色, 华为手机壳A1)</option>
                     <option value="23" data-color="fourColor" data-size="3.98_768_552">3.98寸 (四色, A1-202511)</option>
+                    <option value="25" data-color="fourColor" data-size="1.54_200_200">1.54寸 (四色, JD79667 200x200)</option>
                     <option value="1f" data-color="sixColor" data-size="3.98_768_552">3.98寸 (六色, 高分E6)</option>
                     <option value="01" data-color="blackWhiteColor" data-size="4.2_400_300">4.2寸 (黑白, UC8176)</option>
                     <option value="02" data-color="threeColor" data-size="4.2_400_300" selected>4.2寸 (三色, UC8176)</option>
@@ -2118,8 +2100,8 @@ const DRIVER_PRESETS = [
         name: "TSL0922驱动",
         // 选项HTML（与原 QuDong_Tsl0922 完全一致）
         optionsHtml: `
-                    <option value="14" data-color="fourColor" data-size="3.98_768_552">3.98寸A0 (四色, JD79660)</option>
-                    <option value="15" data-color="fourColor" data-size="3.98_768_552">3.98寸A1 (四色, JD79661)</option>
+                    <option value="14" data-color="fourColor" data-size="3.98_768_552">3.98寸A0 (四色, JD79665)</option>
+                    <option value="15" data-color="fourColor" data-size="3.98_768_552">3.98寸A1 (四色, JD79665)</option>
                     <option value="01" data-color="blackWhiteColor" data-size="4.2_400_300">4.2寸 (黑白, UC8176)</option>
                     <option value="03" data-color="threeColor" data-size="4.2_400_300"  selected>4.2寸 (三色, UC8176)</option>
                     <option value="04" data-color="blackWhiteColor" data-size="4.2_400_300">4.2寸 (黑白, SSD1619)</option>
@@ -2176,11 +2158,15 @@ const DRIVER_PRESETS = [
 
 const ACTIVE_DRIVER_PRESETS = [{
     id: "dongshan",
-    name: "东山 A0/A1",
+    name: "东山 A0/A1/E6",
     optionsHtml: `
+        <option value="1c" data-color="fourColor" data-size="3.87_800_480">3.87寸 (四色, KEGM038701E01-J665)</option>
         <option value="14" data-color="fourColor" data-size="3.98_768_552" selected>3.98寸 (四色, 华为手机壳A0)</option>
         <option value="15" data-color="fourColor" data-size="3.98_768_552">3.98寸 (四色, 华为手机壳A1)</option>
         <option value="23" data-color="fourColor" data-size="3.98_768_552">3.98寸 (四色, 华为手机壳A1.1)</option>
+        <option value="25" data-color="fourColor" data-size="1.54_200_200">1.54寸 (四色, JD79667 200x200)</option>
+        <option value="24" data-color="sixColor" data-size="3.68_E6_792_528">3.68寸 (六色, 高分E6 528x792)</option>
+        <option value="1f" data-color="sixColor" data-size="3.98_E6_768_552">3.98寸 (六色, 高分E6 552x768)</option>
     `
 }];
 
